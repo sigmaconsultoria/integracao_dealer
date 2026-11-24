@@ -1,0 +1,20 @@
+# Dependencies & build
+node_modules/
+dist/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+token.json
+pg.txt
+
+# Runtime state & logs
+.runtime/
+*.log
+
+# Legacy scripts & PII dumps
+legacy/
+
+# Local AI index cache
+.trail/
