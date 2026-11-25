@@ -302,22 +302,29 @@ export async function finalizeLead(request: FastifyRequest, reply: FastifyReply)
 
 /**
  * POST /leads/sync
- * Rota para atualizar e sincronizar novos leads do Followize para o PostgreSQL
+ * Rota para atualizar e sincronizar novos leads do Followize para o PostgreSQL em segundo plano
  */
 export async function syncDatabase(request: FastifyRequest, reply: FastifyReply) {
   const { custom_date, full } = syncQuerySchema.parse(request.query);
-  const result = await syncService.syncLeads(custom_date, full);
 
-  return reply.send(result);
+  syncService.startSyncInBackground(custom_date, full);
+
+  return reply.status(202).send({
+    success: true,
+    accepted: true,
+    message: 'Sincronização iniciada em segundo plano.',
+    sync: await syncService.getSyncStatus(),
+  });
 }
 
 /**
  * GET /leads/sync/status
- * Retorna status e próximas execuções do agendador cron de sincronização
+ * Retorna status e próximas execuções do agendador cron e da sincronização
  */
 export async function getSyncSchedulerStatus(_request: FastifyRequest, reply: FastifyReply) {
   return reply.send({
     success: true,
     scheduler: syncScheduler.getStatus(),
+    sync: await syncService.getSyncStatus(),
   });
 }

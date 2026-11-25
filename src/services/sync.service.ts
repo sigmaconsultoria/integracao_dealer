@@ -22,6 +22,24 @@ export interface SyncResult {
   message: string;
 }
 
+export interface SyncProgress {
+  started_at: string;
+  current_page: number;
+  last_page: number | null;
+  pages_processed: number;
+  total_synced: number;
+  total_records: number | null;
+}
+
+export interface SyncStatusSnapshot {
+  in_progress: boolean;
+  progress: SyncProgress | null;
+  last_completed_at: string | null;
+  last_start_date: string | null;
+  last_result: SyncResult | null;
+  last_error: string | null;
+}
+
 export interface SyncServiceDeps {
   db?: DbPoolLike;
   auth?: AuthClientLike;
@@ -132,6 +150,9 @@ export class SyncService {
   private readonly logger: AppLogger;
 
   private activeSyncStartedAt: string | null = null;
+  private activeProgress: SyncProgress | null = null;
+  private lastResult: SyncResult | null = null;
+  private lastError: string | null = null;
 
   constructor(deps: SyncServiceDeps = {}) {
     this.db = deps.db ?? pool;
@@ -330,6 +351,15 @@ export class SyncService {
     }
 
     this.activeSyncStartedAt = new Date().toISOString();
+    this.activeProgress = {
+      started_at: this.activeSyncStartedAt,
+      current_page: 0,
+      last_page: null,
+      pages_processed: 0,
+      total_synced: 0,
+      total_records: null,
+    };
+    this.lastError = null;
     const startTime = Date.now();
 
     try {
@@ -369,6 +399,12 @@ export class SyncService {
             : currentPage;
         const totalRecords = Number(meta.total ?? leadsBatch.length);
 
+        if (this.activeProgress) {
+          this.activeProgress.current_page = currentPage;
+          this.activeProgress.last_page = lastPage;
+          this.activeProgress.total_records = Number.isFinite(totalRecords) ? totalRecords : null;
+        }
+
         if (!leadsBatch.length || totalRecords === 0) {
           break;
         }
@@ -380,6 +416,10 @@ export class SyncService {
           await client.query('COMMIT');
           totalSynced += savedCount;
           pagesProcessed++;
+          if (this.activeProgress) {
+            this.activeProgress.pages_processed = pagesProcessed;
+            this.activeProgress.total_synced = totalSynced;
+          }
           this.logger.info(
             {
               page: currentPage,
@@ -413,7 +453,7 @@ export class SyncService {
 
       const durationSeconds = Math.round((Date.now() - startTime) / 1000);
 
-      return {
+      const result: SyncResult = {
         success: true,
         startDate,
         totalSynced,
@@ -422,9 +462,52 @@ export class SyncService {
         durationSeconds,
         message: `Sincronização concluída com sucesso. ${totalSynced} leads processados em ${durationSeconds}s.`,
       };
+
+      this.lastResult = result;
+      this.lastError = null;
+      return result;
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+      throw err;
     } finally {
       this.activeSyncStartedAt = null;
+      this.activeProgress = null;
     }
+  }
+
+  /**
+   * Retorna o estado atual da sincronização (em memória + watermark persistido em disco).
+   */
+  async getSyncStatus(): Promise<SyncStatusSnapshot> {
+    const state = await this.readSyncState();
+    return {
+      in_progress: Boolean(this.activeSyncStartedAt),
+      progress: this.activeProgress ? { ...this.activeProgress } : null,
+      last_completed_at: state?.last_completed_at ?? null,
+      last_start_date: state?.last_start_date ?? null,
+      last_result: this.lastResult,
+      last_error: this.lastError,
+    };
+  }
+
+  /**
+   * Dispara a sincronização em segundo plano sem bloquear a resposta HTTP.
+   */
+  startSyncInBackground(customDate?: string, fullSync = false): void {
+    if (this.activeSyncStartedAt) {
+      throw new AppError(
+        409,
+        `Sincronização já está em andamento desde ${this.activeSyncStartedAt}`,
+        'SYNC_IN_PROGRESS'
+      );
+    }
+
+    void this.syncLeads(customDate, fullSync).catch((err) => {
+      this.logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Falha na sincronização assíncrona de leads'
+      );
+    });
   }
 
   /**

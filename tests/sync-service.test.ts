@@ -406,4 +406,81 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     const backfillRes = await sync.syncLeads('2026-11-09 00:00:00', false);
     assert.equal(backfillRes.totalSynced, 1);
   });
+
+  it('reports live sync progress, persisted last_completed_at, and last_error via getSyncStatus', async () => {
+    const statePath = await createTempStatePath();
+    let statusDuringRun: Awaited<ReturnType<SyncService['getSyncStatus']>> | null = null;
+    let shouldFail = false;
+
+    const db: DbPoolLike = {
+      query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
+      connect: async () => ({
+        query: async (sql) => {
+          if (sql.includes('SELECT id, updated_at FROM leads')) {
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+        release: () => undefined,
+      }),
+    };
+
+    const sync = new SyncService({
+      db,
+      auth: {
+        authenticatedFetch: async (url) => {
+          if (shouldFail) {
+            return new Response('upstream boom', { status: 400 });
+          }
+          const page = new URL(url).searchParams.get('page');
+          if (page === '2') {
+            statusDuringRun = await sync.getSyncStatus();
+            return new Response(
+              JSON.stringify({
+                data: [makeSampleLead(2)],
+                meta: { current_page: 2, last_page: 2, total: 2 },
+              }),
+              { status: 200 }
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              data: [makeSampleLead(1)],
+              meta: { current_page: 1, last_page: 2, total: 2 },
+            }),
+            { status: 200 }
+          );
+        },
+      },
+      statePath,
+      pageDelayMs: 0,
+      maxRetries: 0,
+      logger: silentLogger,
+    });
+
+    const initialStatus = await sync.getSyncStatus();
+    assert.equal(initialStatus.in_progress, false);
+    assert.equal(initialStatus.progress, null);
+    assert.equal(initialStatus.last_completed_at, null);
+
+    await sync.syncLeads();
+    assert.ok(statusDuringRun);
+    assert.equal(statusDuringRun.in_progress, true);
+    assert.equal(statusDuringRun.progress?.pages_processed, 1);
+    assert.equal(statusDuringRun.progress?.last_page, 2);
+    assert.equal(statusDuringRun.progress?.total_synced, 1);
+
+    const statusAfterSuccess = await sync.getSyncStatus();
+    assert.equal(statusAfterSuccess.in_progress, false);
+    assert.equal(statusAfterSuccess.progress, null);
+    assert.ok(statusAfterSuccess.last_completed_at);
+    assert.equal(statusAfterSuccess.last_result?.totalSynced, 2);
+    assert.equal(statusAfterSuccess.last_error, null);
+
+    shouldFail = true;
+    await assert.rejects(() => sync.syncLeads());
+    const statusAfterError = await sync.getSyncStatus();
+    assert.equal(statusAfterError.in_progress, false);
+    assert.ok(statusAfterError.last_error?.includes('HTTP 400'));
+  });
 });

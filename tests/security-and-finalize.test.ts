@@ -436,27 +436,27 @@ describe('Security middleware, Zod validation, and error sanitization', () => {
       liveCheck: false,
     });
 
-    // POST /leads/sync?full=false MUST pass fullSync=false (not Boolean("false") === true)
+    // POST /leads/sync?full=false MUST pass fullSync=false (not Boolean("false") === true) and run in background (202)
     let syncArgs: Array<unknown> = [];
-    mock.method(syncService, 'syncLeads', async (customDate?: string, fullSync = false) => {
+    mock.method(syncService, 'startSyncInBackground', (customDate?: string, fullSync = false) => {
       syncArgs = [customDate, fullSync];
-      return {
-        success: true,
-        startDate: customDate ?? '2026-11-20 00:00:00',
-        totalSynced: 0,
-        pagesProcessed: 0,
-        resumedFromPending: false,
-        durationSeconds: 0,
-        message: 'ok',
-      };
     });
+    mock.method(syncService, 'getSyncStatus', async () => ({
+      in_progress: true,
+      progress: null,
+      last_completed_at: null,
+      last_start_date: null,
+      last_result: null,
+      last_error: null,
+    }));
 
     const syncFalse = await app.inject({
       method: 'POST',
       url: '/leads/sync?full=false',
       headers: { 'x-api-key': VALID_TEST_API_KEY },
     });
-    assert.equal(syncFalse.statusCode, 200);
+    assert.equal(syncFalse.statusCode, 202);
+    assert.equal(syncFalse.json().accepted, true);
     assert.deepEqual(syncArgs, [undefined, false]);
 
     const syncCustomDate = await app.inject({
@@ -464,7 +464,8 @@ describe('Security middleware, Zod validation, and error sanitization', () => {
       url: '/leads/sync?custom_date=2026-11-10T14:30:00',
       headers: { 'x-api-key': VALID_TEST_API_KEY },
     });
-    assert.equal(syncCustomDate.statusCode, 200);
+    assert.equal(syncCustomDate.statusCode, 202);
+    assert.equal(syncCustomDate.json().accepted, true);
     assert.deepEqual(syncArgs, ['2026-11-10 14:30:00', false]);
 
     for (const badQs of ['custom_date=2026-02-31', 'custom_date=lixo', 'full=maybe']) {
@@ -648,6 +649,14 @@ describe('Security middleware, Zod validation, and error sanitization', () => {
       last_result: null,
       last_error: null,
     }));
+    mock.method(syncService, 'getSyncStatus', async () => ({
+      in_progress: false,
+      progress: null,
+      last_completed_at: '2026-11-24T14:00:00.000Z',
+      last_start_date: '2026-11-24 08:00:00',
+      last_result: null,
+      last_error: null,
+    }));
     const schedRes = await app.inject({
       method: 'GET',
       url: '/leads/sync/status',
@@ -655,5 +664,6 @@ describe('Security middleware, Zod validation, and error sanitization', () => {
     });
     assert.equal(schedRes.statusCode, 200);
     assert.equal(schedRes.json().scheduler.active, true);
+    assert.equal(schedRes.json().sync.last_completed_at, '2026-11-24T14:00:00.000Z');
   });
 });
