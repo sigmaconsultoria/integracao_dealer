@@ -1,16 +1,24 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { pool } from './config/database.js';
-import { env } from './config/env.js';
+import { env, type FollowizeUnitConfig } from './config/env.js';
 import { authRoutes } from './modules/auth/auth.routes.js';
+import type { DbPoolLike } from './modules/leads/leads.service.js';
 import { leadsRoutes } from './modules/leads/leads.routes.js';
 import { createApiKeyAuthHook } from './plugins/auth.js';
-import { authService } from './services/auth.service.js';
+import { authManager as defaultAuthManager, type AuthManagerLike } from './services/auth.service.js';
+
+export interface UnitReadinessStatus {
+  status: 'ok' | 'error';
+  has_refresh_token: boolean;
+  has_valid_access_token: boolean;
+}
 
 export interface ReadinessCheckResult {
-  ready: boolean;
+  status: 'ready' | 'degraded' | 'not_ready';
   checks: {
     database: 'ok' | 'error';
-    followize_config: 'ok' | 'error';
+    followize_config: 'ok' | 'degraded' | 'error';
+    followize_units: Record<string, UnitReadinessStatus>;
   };
 }
 
@@ -20,37 +28,84 @@ export interface AppRoutesOptions {
   readinessCheck?: () => Promise<ReadinessCheckResult>;
 }
 
-export async function defaultReadinessCheck(): Promise<ReadinessCheckResult> {
-  let dbStatus: 'ok' | 'error' = 'error';
-  try {
-    await pool.query('SELECT 1');
-    dbStatus = 'ok';
-  } catch {
-    dbStatus = 'error';
-  }
+export function createReadinessCheck(deps: {
+  db: Pick<DbPoolLike, 'query'>;
+  authManager: Pick<AuthManagerLike, 'getTokenStatus'>;
+  clients: Record<string, FollowizeUnitConfig>;
+}): () => Promise<ReadinessCheckResult> {
+  return async (): Promise<ReadinessCheckResult> => {
+    let dbStatus: 'ok' | 'error' = 'error';
+    try {
+      await deps.db.query('SELECT 1');
+      dbStatus = 'ok';
+    } catch {
+      dbStatus = 'error';
+    }
 
-  let hasRefreshToken = false;
-  try {
-    hasRefreshToken = (await authService.getTokenStatus()).has_refresh_token;
-  } catch {
-    hasRefreshToken = false;
-  }
+    const units = Object.keys(deps.clients);
+    const followizeUnits: Record<string, UnitReadinessStatus> = {};
 
-  const followizeConfigured =
-    Boolean(env.FOLLOWIZE_CLIENT_ID) &&
-    Boolean(env.FOLLOWIZE_CLIENT_SECRET) &&
-    hasRefreshToken;
+    await Promise.all(
+      units.map(async (unit) => {
+        const cfg = deps.clients[unit];
+        const hasCredentials = Boolean(cfg?.clientId) && Boolean(cfg?.clientSecret);
+        let hasRefreshToken = false;
+        let hasValidAccessToken = false;
 
-  const followizeConfigStatus: 'ok' | 'error' = followizeConfigured ? 'ok' : 'error';
+        try {
+          const tokenStatus = await deps.authManager.getTokenStatus(unit);
+          hasRefreshToken = tokenStatus.has_refresh_token;
+          hasValidAccessToken = tokenStatus.has_valid_access_token;
+        } catch {
+          hasRefreshToken = false;
+          hasValidAccessToken = false;
+        }
 
-  return {
-    ready: dbStatus === 'ok' && followizeConfigStatus === 'ok',
-    checks: {
-      database: dbStatus,
-      followize_config: followizeConfigStatus,
-    },
+        followizeUnits[unit] = {
+          status: hasCredentials && hasRefreshToken ? 'ok' : 'error',
+          has_refresh_token: hasRefreshToken,
+          has_valid_access_token: hasValidAccessToken,
+        };
+      })
+    );
+
+    const totalUnits = units.length;
+    const okUnitsCount = Object.values(followizeUnits).filter((u) => u.status === 'ok').length;
+
+    let followizeConfigStatus: 'ok' | 'degraded' | 'error';
+    if (totalUnits > 0 && okUnitsCount === totalUnits) {
+      followizeConfigStatus = 'ok';
+    } else if (okUnitsCount > 0) {
+      followizeConfigStatus = 'degraded';
+    } else {
+      followizeConfigStatus = 'error';
+    }
+
+    let overallStatus: 'ready' | 'degraded' | 'not_ready';
+    if (dbStatus === 'error' || okUnitsCount === 0) {
+      overallStatus = 'not_ready';
+    } else if (okUnitsCount === totalUnits) {
+      overallStatus = 'ready';
+    } else {
+      overallStatus = 'degraded';
+    }
+
+    return {
+      status: overallStatus,
+      checks: {
+        database: dbStatus,
+        followize_config: followizeConfigStatus,
+        followize_units: followizeUnits,
+      },
+    };
   };
 }
+
+export const defaultReadinessCheck = createReadinessCheck({
+  db: pool,
+  authManager: defaultAuthManager,
+  clients: env.FOLLOWIZE_CLIENTS,
+});
 
 export const appRoutes: FastifyPluginAsync<AppRoutesOptions> = async (app, options) => {
   const apiKeys = options.apiKeys ?? env.VALID_API_KEYS;
@@ -76,7 +131,7 @@ export const appRoutes: FastifyPluginAsync<AppRoutesOptions> = async (app, optio
     }
   );
 
-  // Readiness check (público — verifica conectividade DB e config Followize sem vazar detalhes)
+  // Readiness check (público — verifica conectividade DB e status separado por unidade Followize)
   app.get(
     '/ready',
     {
@@ -89,7 +144,8 @@ export const appRoutes: FastifyPluginAsync<AppRoutesOptions> = async (app, optio
     },
     async (request, reply) => {
       const result = await runReadinessCheck();
-      if (!result.ready) {
+
+      if (result.status === 'not_ready') {
         request.log.warn({ checks: result.checks }, 'Readiness check failed');
         return reply.status(503).send({
           status: 'not_ready',
@@ -97,8 +153,12 @@ export const appRoutes: FastifyPluginAsync<AppRoutesOptions> = async (app, optio
         });
       }
 
+      if (result.status === 'degraded') {
+        request.log.warn({ checks: result.checks }, 'Readiness check degraded');
+      }
+
       return {
-        status: 'ready',
+        status: result.status,
         checks: result.checks,
       };
     }

@@ -1,9 +1,23 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { UNIT_CODE_REGEX } from '../../config/env.js';
 import { AppError } from '../../errors/app-error.js';
 import { syncScheduler } from '../../services/scheduler.service.js';
 import { syncService } from '../../services/sync.service.js';
 import { leadsService, type FinalizationPayload } from './leads.service.js';
+
+const optionalUnitSchema = z.preprocess(
+  (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+  z
+    .string()
+    .trim()
+    .transform((val) => val.toUpperCase())
+    .refine(
+      (val) => UNIT_CODE_REGEX.test(val),
+      'unidade deve conter de 2 a 10 caracteres alfanuméricos, _ ou -'
+    )
+    .optional()
+);
 
 function queryBoolean(defaultValue: boolean) {
   return z.preprocess((val) => {
@@ -58,6 +72,7 @@ const permittedLeadsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30),
   only_actionable: queryBoolean(false),
   live_check: queryBoolean(true),
+  unidade: optionalUnitSchema,
 });
 
 const syncDateSchema = z
@@ -76,6 +91,7 @@ const syncQuerySchema = z.object({
     syncDateSchema.optional()
   ),
   full: queryBoolean(false),
+  unidade: optionalUnitSchema,
 });
 
 const typeOfSaleEnum = z.enum([
@@ -159,12 +175,15 @@ const finalizeBodySchema = z
  * indicando se está pronto para finalizar ou se tem bloqueios (agendamento pendente/já finalizado).
  */
 export async function getPermittedLeads(request: FastifyRequest, reply: FastifyReply) {
-  const { days, only_actionable, live_check } = permittedLeadsQuerySchema.parse(request.query);
+  const { days, only_actionable, live_check, unidade } = permittedLeadsQuerySchema.parse(
+    request.query
+  );
 
   const result = await leadsService.getPermittedLeads({
     days,
     onlyActionable: only_actionable,
     liveCheck: live_check,
+    ...(unidade ? { unidade } : {}),
   });
 
   return reply.send({
@@ -197,6 +216,7 @@ export async function previewFinalization(request: FastifyRequest, reply: Fastif
   return reply.send({
     success: true,
     lead_id: leadId,
+    unidade: finStatus.unidade,
     simulated: true,
     message: 'Pré-visualização somente leitura. Nenhuma alteração foi realizada na Followize.',
     target_endpoint: `https://api.followize.com.br/v3/leads/${leadId}/finalization/realized_sale`,
@@ -216,8 +236,12 @@ export async function finalizeLead(request: FastifyRequest, reply: FastifyReply)
   const body = finalizeBodySchema.parse(request.body);
   const isSimulation = body.simulate;
 
+  let leadUnidade: string | undefined;
   if (!isSimulation) {
     const finStatus = await leadsService.getFinalizationStatus(leadId);
+    if (!finStatus.exists) {
+      throw new AppError(404, `Lead ${leadId} não encontrado no banco local`, 'LEAD_NOT_FOUND');
+    }
     if (finStatus.alreadyFinalized) {
       throw new AppError(
         409,
@@ -225,6 +249,7 @@ export async function finalizeLead(request: FastifyRequest, reply: FastifyReply)
         'ALREADY_FINALIZED'
       );
     }
+    leadUnidade = leadsService.assertUnitAvailable(leadId, finStatus.unidade);
   }
 
   // 1. Gera o payload base a partir do banco de dados
@@ -260,7 +285,12 @@ export async function finalizeLead(request: FastifyRequest, reply: FastifyReply)
       } else {
         const cancelMsg =
           body.cancel_message || 'Cancelado automaticamente para fechamento de venda';
-        const cancelRes = await leadsService.cancelSchedule(leadId, pendingSched.id, cancelMsg);
+        const cancelRes = await leadsService.cancelSchedule(
+          leadId,
+          pendingSched.id,
+          cancelMsg,
+          leadUnidade
+        );
         scheduleCanceledInfo = {
           simulated: false,
           schedule_id: pendingSched.id,
@@ -305,9 +335,9 @@ export async function finalizeLead(request: FastifyRequest, reply: FastifyReply)
  * Rota para atualizar e sincronizar novos leads do Followize para o PostgreSQL em segundo plano
  */
 export async function syncDatabase(request: FastifyRequest, reply: FastifyReply) {
-  const { custom_date, full } = syncQuerySchema.parse(request.query);
+  const { custom_date, full, unidade } = syncQuerySchema.parse(request.query);
 
-  syncService.startSyncInBackground(custom_date, full);
+  syncService.startSyncInBackground(custom_date, full, unidade);
 
   return reply.status(202).send({
     success: true,

@@ -19,7 +19,7 @@ export interface SyncSchedulerStatus {
   schedules: string[];
   next_runs: string[];
   last_run_at: string | null;
-  last_status: 'idle' | 'running' | 'success' | 'skipped' | 'error';
+  last_status: 'idle' | 'running' | 'success' | 'partial_failure' | 'skipped' | 'error';
   last_trigger: string | null;
   last_result: SyncResult | null;
   last_error: string | null;
@@ -34,7 +34,8 @@ export class SyncScheduler {
 
   private jobs: Cron[] = [];
   private lastRunAt: string | null = null;
-  private lastStatus: 'idle' | 'running' | 'success' | 'skipped' | 'error' = 'idle';
+  private lastStatus: 'idle' | 'running' | 'success' | 'partial_failure' | 'skipped' | 'error' =
+    'idle';
   private lastTrigger: string | null = null;
   private lastResult: SyncResult | null = null;
   private lastError: string | null = null;
@@ -99,8 +100,40 @@ export class SyncScheduler {
 
     try {
       const result = await this.runSync();
-      this.lastStatus = 'success';
+      const unitsSummary = Object.fromEntries(
+        Object.entries(result.units ?? {}).map(([unit, unitResult]) => [
+          unit,
+          {
+            success: unitResult.success,
+            totalSynced: unitResult.totalSynced,
+            pagesProcessed: unitResult.pagesProcessed,
+            ...(unitResult.error ? { error: unitResult.error } : {}),
+          },
+        ])
+      );
+
       this.lastResult = result;
+
+      if (result.partial_failure) {
+        const failedUnits = Object.values(result.units ?? {})
+          .filter((u) => !u.success)
+          .map((u) => `${u.unidade}: ${u.error ?? u.message}`);
+        this.lastStatus = 'partial_failure';
+        this.lastError = failedUnits.length > 0 ? failedUnits.join('; ') : result.message;
+        this.logger.warn(
+          {
+            triggerExpression,
+            totalSynced: result.totalSynced,
+            pagesProcessed: result.pagesProcessed,
+            durationSeconds: result.durationSeconds,
+            units: unitsSummary,
+          },
+          'Sincronização agendada concluída com falha parcial'
+        );
+        return;
+      }
+
+      this.lastStatus = 'success';
       this.lastError = null;
       this.logger.info(
         {
@@ -108,6 +141,7 @@ export class SyncScheduler {
           totalSynced: result.totalSynced,
           pagesProcessed: result.pagesProcessed,
           durationSeconds: result.durationSeconds,
+          units: unitsSummary,
         },
         'Sincronização agendada concluída'
       );

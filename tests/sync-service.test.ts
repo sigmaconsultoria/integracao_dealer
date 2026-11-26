@@ -5,7 +5,9 @@ import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { AppError } from '../src/errors/app-error.js';
 import type { AuthClientLike, DbClientLike, DbPoolLike } from '../src/modules/leads/leads.service.js';
+import type { SyncAuthManagerLike } from '../src/services/sync.service.js';
 import { SyncService } from '../src/services/sync.service.js';
+import { MemorySyncStateStore, PostgresSyncStateStore } from '../src/services/sync-state-store.js';
 
 const silentLogger = {
   info: () => undefined,
@@ -97,7 +99,37 @@ function makeSampleLead(id: number, overrides: Record<string, any> = {}) {
   };
 }
 
-describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)', () => {
+function createMockMultiUnitAuthManager(
+  clients: Record<string, AuthClientLike>
+): SyncAuthManagerLike {
+  const units = Object.keys(clients);
+  return {
+    getUnits: () => [...units],
+    hasUnit: (u: string) => units.includes(u.trim().toUpperCase()),
+    resolveUnit: (u?: string, opts?: { allowSingleDefault?: boolean }) => {
+      const norm = typeof u === 'string' ? u.trim().toUpperCase() : '';
+      if (!norm) {
+        if (opts?.allowSingleDefault && units.length === 1) {
+          return units[0]!;
+        }
+        throw new AppError(400, 'Unidade obrigatória', 'UNIT_REQUIRED');
+      }
+      if (!clients[norm]) {
+        throw new AppError(400, `Unidade inválida: ${norm}`, 'INVALID_UNIT');
+      }
+      return norm;
+    },
+    getClient: (u: string) => {
+      const norm = u.trim().toUpperCase();
+      if (!clients[norm]) {
+        throw new AppError(400, `Unidade inválida: ${norm}`, 'INVALID_UNIT');
+      }
+      return clients[norm] as ReturnType<SyncAuthManagerLike['getClient']>;
+    },
+  };
+}
+
+describe('SyncService (17 tables UNNEST, multi-unit watermark, isolation, and status)', () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
@@ -115,14 +147,14 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     return path.join(dir, '.runtime', 'sync-state.json');
   }
 
-  it('upserts all 17 tables via UNNEST, deduplicates entities, and preserves zero values', async () => {
+  it('upserts all 17 tables via UNNEST, sets unidade ONLY on 4 tables, deduplicates entities, and preserves zero values', async () => {
     const statePath = await createTempStatePath();
     const recordedQueries: Array<{ sql: string; params?: any[] }> = [];
 
     const txClient: DbClientLike = {
       query: async (sql, params) => {
         recordedQueries.push({ sql, params });
-        if (sql.includes('SELECT id, updated_at FROM leads')) {
+        if (sql.includes('SELECT id, updated_at, unidade FROM leads')) {
           return { rows: [] };
         }
         return { rows: [], rowCount: 1 };
@@ -141,7 +173,6 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
       connect: async () => txClient,
     };
 
-    // Two leads sharing attendant.id=10 and contact.id=101 -> must deduplicate in UNNEST!
     const lead1 = makeSampleLead(1);
     const lead2 = makeSampleLead(2, {
       contact: { ...makeSampleLead(1).contact, id: 101 },
@@ -170,7 +201,9 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     assert.equal(res.success, true);
     assert.equal(res.totalSynced, 2);
     assert.equal(res.pagesProcessed, 1);
+    assert.equal(res.units.MT?.success, true);
 
+    const tablesWithUnidade = new Set(['leads_raw', 'teams', 'locations', 'leads']);
     const expectedTables = [
       'leads_raw',
       'attendants',
@@ -195,17 +228,44 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
       const found = recordedQueries.find((q) => q.sql.includes(`INSERT INTO ${table} (`));
       assert.ok(found, `Expected UNNEST INSERT into ${table}`);
       assert.equal(found.sql.includes('UNNEST('), true, `${table} must use UNNEST`);
+
+      if (tablesWithUnidade.has(table)) {
+        assert.equal(found.sql.includes('unidade'), true, `${table} must include unidade`);
+        assert.equal(
+          found.sql.includes(`WHERE ${table}.unidade = EXCLUDED.unidade`),
+          true,
+          `${table} must guard ON CONFLICT UPDATE with WHERE ${table}.unidade = EXCLUDED.unidade`
+        );
+        const withoutWhereGuard = found.sql.replace(
+          `WHERE ${table}.unidade = EXCLUDED.unidade`,
+          ''
+        );
+        assert.equal(
+          withoutWhereGuard.includes('unidade = EXCLUDED.unidade'),
+          false,
+          `${table} MUST NOT reassign unidade on conflict`
+        );
+      } else {
+        assert.equal(found.sql.includes('unidade'), false, `${table} MUST NOT include unidade`);
+      }
     }
 
-    // Deduplication check: attendants had id=10 on both leads -> only 1 entry
+    // Watermark fallback query filtered by WHERE unidade = $1
+    const maxUpdatedQuery = recordedQueries.find((q) => q.sql.includes('MAX(updated_at)'));
+    assert.equal(maxUpdatedQuery?.sql.includes('WHERE unidade = $1'), true);
+    assert.deepEqual(maxUpdatedQuery?.params, ['MT']);
+
+    // Deduplication check
     const attendantsInsert = recordedQueries.find((q) =>
       q.sql.includes('INSERT INTO attendants (')
     );
     assert.deepEqual(attendantsInsert?.params?.[0], [10]);
 
-    // Zero values preserved: leads.vehicle_price='0', last_proposal.amount=0, finalization.amount=0, finalization.order_number='0'
+    // Zero values preserved + unidade appended at $23
     const leadsInsert = recordedQueries.find((q) => q.sql.includes('INSERT INTO leads ('));
     assert.equal(leadsInsert?.params?.[12]?.[0], '0');
+    assert.deepEqual(leadsInsert?.params?.[22], ['MT', 'MT']);
+
     const proposalInsert = recordedQueries.find((q) =>
       q.sql.includes('INSERT INTO last_proposal (')
     );
@@ -307,13 +367,11 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
       logger: silentLogger,
     });
 
-    // Run 1 fails on page 2 after committing page 1
     await assert.rejects(() => sync.syncLeads());
 
     const stateAfterFailure = JSON.parse(await fs.readFile(statePath, 'utf-8'));
-    assert.equal(stateAfterFailure.pending_start_date, '2026-11-10 08:00:00');
+    assert.equal(stateAfterFailure.MT.pending_start_date, '2026-11-10 08:00:00');
 
-    // Even if DB MAX(updated_at) advanced meanwhile, Run 2 must resume from pending_start_date
     shouldFailPage2 = false;
     const resumedRes = await sync.syncLeads();
     assert.equal(resumedRes.resumedFromPending, true);
@@ -321,8 +379,8 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     assert.equal(resumedRes.pagesProcessed, 2);
 
     const stateAfterSuccess = JSON.parse(await fs.readFile(statePath, 'utf-8'));
-    assert.equal(stateAfterSuccess.pending_start_date, null);
-    assert.ok(stateAfterSuccess.last_completed_at);
+    assert.equal(stateAfterSuccess.MT.pending_start_date, null);
+    assert.ok(stateAfterSuccess.MT.last_completed_at);
   });
 
   it('retries transient 429/503 responses with backoff before succeeding', async () => {
@@ -368,7 +426,7 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     assert.equal(res.totalSynced, 1);
   });
 
-  it('skips unchanged leads on incremental sync but forces upsert on customDate backfill', async () => {
+  it('skips unchanged leads on incremental sync and forces upsert on customDate backfill for same unit', async () => {
     const statePath = await createTempStatePath();
     const lead = makeSampleLead(1, { updated_at: '2026-11-10T14:00:00.000Z' });
 
@@ -376,8 +434,16 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
       query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
       connect: async () => ({
         query: async (sql) => {
-          if (sql.includes('SELECT id, updated_at FROM leads')) {
-            return { rows: [{ id: 1, updated_at: new Date('2026-11-10T14:00:00.000Z') }] };
+          if (sql.includes('SELECT id, updated_at, unidade FROM leads')) {
+            return {
+              rows: [
+                {
+                  id: 1,
+                  updated_at: new Date('2026-11-10T14:00:00.000Z'),
+                  unidade: 'MT',
+                },
+              ],
+            };
           }
           return { rows: [] };
         },
@@ -396,15 +462,256 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
         ),
     };
 
-    const sync = new SyncService({ db, auth, statePath, pageDelayMs: 0, logger: silentLogger });
+    const sync = new SyncService({
+      db,
+      auth,
+      statePath,
+      pageDelayMs: 0,
+      logger: silentLogger,
+    });
 
-    // Incremental sync skips matching updated_at
     const incRes = await sync.syncLeads();
     assert.equal(incRes.totalSynced, 0);
 
-    // customDate backfill forces upsert into all 17 tables
     const backfillRes = await sync.syncLeads('2026-11-09 00:00:00', false);
     assert.equal(backfillRes.totalSynced, 1);
+  });
+
+  it('blocks batch with 409 UNIT_OWNERSHIP_CONFLICT and rolls back without INSERTs on lead, location, or team conflict (even on forceUpsert)', async () => {
+    // 1) Lead pertencente a PA ao tentar sincronizar MT (incremental e forceUpsert)
+    for (const forceMode of [false, true]) {
+      const stateStore = new MemorySyncStateStore();
+      const txQueries: string[] = [];
+      const errors: Array<{ obj: Record<string, unknown>; msg?: string }> = [];
+
+      const db: DbPoolLike = {
+        query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
+        connect: async () => ({
+          query: async (sql) => {
+            txQueries.push(sql);
+            if (sql.includes('SELECT id, updated_at, unidade FROM leads')) {
+              return {
+                rows: [
+                  {
+                    id: 1,
+                    updated_at: new Date('2026-11-10T14:00:00.000Z'),
+                    unidade: 'PA',
+                  },
+                ],
+              };
+            }
+            return { rows: [] };
+          },
+          release: () => undefined,
+        }),
+      };
+
+      const sync = new SyncService({
+        db,
+        auth: {
+          authenticatedFetch: async () =>
+            new Response(
+              JSON.stringify({
+                data: [makeSampleLead(1)],
+                meta: { current_page: 1, last_page: 1, total: 1 },
+              }),
+              { status: 200 }
+            ),
+        },
+        stateStore,
+        pageDelayMs: 0,
+        logger: {
+          info: () => undefined,
+          warn: () => undefined,
+          error: (obj: any, msg?: string) => errors.push({ obj, msg }),
+        },
+      });
+
+      await assert.rejects(
+        () => sync.syncLeads(forceMode ? '2026-11-09 00:00:00' : undefined, forceMode),
+        (err) =>
+          err instanceof AppError &&
+          err.statusCode === 409 &&
+          err.code === 'UNIT_OWNERSHIP_CONFLICT'
+      );
+      assert.equal(txQueries.includes('ROLLBACK'), true);
+      assert.equal(txQueries.some((q) => q.includes('INSERT INTO ')), false);
+      assert.equal(errors.length > 0, true);
+    }
+
+    // 2) Lead inédito, mas location.id já pertence a MT ao sincronizar AP
+    {
+      const txQueries: string[] = [];
+      const db: DbPoolLike = {
+        query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
+        connect: async () => ({
+          query: async (sql) => {
+            txQueries.push(sql);
+            if (sql.includes('FROM locations WHERE id = ANY')) {
+              return { rows: [{ id: 20, name: 'Loja Cuiabá', unidade: 'MT' }] };
+            }
+            return { rows: [] };
+          },
+          release: () => undefined,
+        }),
+      };
+
+      const authManager = createMockMultiUnitAuthManager({
+        AP: {
+          authenticatedFetch: async () =>
+            new Response(
+              JSON.stringify({
+                data: [makeSampleLead(999, { location: { id: 20, name: 'Loja Cuiabá' } })],
+                meta: { current_page: 1, last_page: 1, total: 1 },
+              }),
+              { status: 200 }
+            ),
+        },
+      });
+
+      const sync = new SyncService({
+        db,
+        authManager,
+        stateStore: new MemorySyncStateStore(),
+        pageDelayMs: 0,
+        logger: silentLogger,
+      });
+
+      await assert.rejects(
+        () => sync.syncLeads(undefined, false, 'AP'),
+        (err) =>
+          err instanceof AppError &&
+          err.statusCode === 409 &&
+          err.code === 'UNIT_OWNERSHIP_CONFLICT'
+      );
+      assert.equal(txQueries.includes('ROLLBACK'), true);
+      assert.equal(txQueries.some((q) => q.includes('INSERT INTO ')), false);
+    }
+
+    // 3) Lead inédito e loja inédita, mas team.id já pertence a MT ao sincronizar PA
+    {
+      const txQueries: string[] = [];
+      const db: DbPoolLike = {
+        query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
+        connect: async () => ({
+          query: async (sql) => {
+            txQueries.push(sql);
+            if (sql.includes('FROM teams WHERE id = ANY')) {
+              return { rows: [{ id: 40, name: 'Comercial Cuiabá', unidade: 'MT' }] };
+            }
+            return { rows: [] };
+          },
+          release: () => undefined,
+        }),
+      };
+
+      const authManager = createMockMultiUnitAuthManager({
+        PA: {
+          authenticatedFetch: async () =>
+            new Response(
+              JSON.stringify({
+                data: [
+                  makeSampleLead(888, {
+                    location: { id: 9999, name: 'Loja PA' },
+                    team: { id: 40, name: 'Comercial Cuiabá' },
+                  }),
+                ],
+                meta: { current_page: 1, last_page: 1, total: 1 },
+              }),
+              { status: 200 }
+            ),
+        },
+      });
+
+      const sync = new SyncService({
+        db,
+        authManager,
+        stateStore: new MemorySyncStateStore(),
+        pageDelayMs: 0,
+        logger: silentLogger,
+      });
+
+      await assert.rejects(
+        () => sync.syncLeads(undefined, false, 'PA'),
+        (err) =>
+          err instanceof AppError &&
+          err.statusCode === 409 &&
+          err.code === 'UNIT_OWNERSHIP_CONFLICT'
+      );
+      assert.equal(txQueries.includes('ROLLBACK'), true);
+      assert.equal(txQueries.some((q) => q.includes('INSERT INTO ')), false);
+    }
+
+    // 4) No sync multi-unidade (MT, PA, AP), se AP cair em UNIT_OWNERSHIP_CONFLICT, MT e PA continuam com sucesso
+    {
+      const insertedByUnit: string[] = [];
+      const db: DbPoolLike = {
+        query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
+        connect: async () => ({
+          query: async (sql, params) => {
+            if (sql.includes('FROM locations WHERE id = ANY') && params?.[1] === 'AP') {
+              return { rows: [{ id: 3939, name: 'MÔNACO MOTOCENTER MATRIZ', unidade: 'PA' }] };
+            }
+            if (sql.includes('INSERT INTO leads (')) {
+              insertedByUnit.push(...(params?.[22] ?? []));
+            }
+            return { rows: [] };
+          },
+          release: () => undefined,
+        }),
+      };
+
+      const authManager = createMockMultiUnitAuthManager({
+        MT: {
+          authenticatedFetch: async () =>
+            new Response(
+              JSON.stringify({
+                data: [makeSampleLead(101, { location: { id: 658, name: 'Cuiabá' } })],
+                meta: { current_page: 1, last_page: 1, total: 1 },
+              }),
+              { status: 200 }
+            ),
+        },
+        PA: {
+          authenticatedFetch: async () =>
+            new Response(
+              JSON.stringify({
+                data: [makeSampleLead(202, { location: { id: 3939, name: 'Belém Matriz' } })],
+                meta: { current_page: 1, last_page: 1, total: 1 },
+              }),
+              { status: 200 }
+            ),
+        },
+        AP: {
+          authenticatedFetch: async () =>
+            new Response(
+              JSON.stringify({
+                data: [makeSampleLead(303, { location: { id: 3939, name: 'Belém Matriz' } })],
+                meta: { current_page: 1, last_page: 1, total: 1 },
+              }),
+              { status: 200 }
+            ),
+        },
+      });
+
+      const sync = new SyncService({
+        db,
+        authManager,
+        stateStore: new MemorySyncStateStore(),
+        pageDelayMs: 0,
+        logger: silentLogger,
+      });
+
+      const res = await sync.syncLeads();
+      assert.equal(res.success, true);
+      assert.equal(res.partial_failure, true);
+      assert.equal(res.totalSynced, 2);
+      assert.equal(res.units.MT?.success, true);
+      assert.equal(res.units.PA?.success, true);
+      assert.equal(res.units.AP?.success, false);
+      assert.ok(res.units.AP?.error?.includes('Bloqueio de segurança'));
+      assert.deepEqual(insertedByUnit, ['MT', 'PA']);
+    }
   });
 
   it('reports live sync progress, persisted last_completed_at, and last_error via getSyncStatus', async () => {
@@ -416,7 +723,7 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
       query: async () => ({ rows: [{ start_date: '2026-11-10 08:00:00' }] }),
       connect: async () => ({
         query: async (sql) => {
-          if (sql.includes('SELECT id, updated_at FROM leads')) {
+          if (sql.includes('SELECT id, updated_at, unidade FROM leads')) {
             return { rows: [] };
           }
           return { rows: [] };
@@ -462,13 +769,16 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     assert.equal(initialStatus.in_progress, false);
     assert.equal(initialStatus.progress, null);
     assert.equal(initialStatus.last_completed_at, null);
+    assert.equal(initialStatus.units.MT?.in_progress, false);
 
     await sync.syncLeads();
     assert.ok(statusDuringRun);
     assert.equal(statusDuringRun.in_progress, true);
+    assert.equal(statusDuringRun.progress?.current_unit, 'MT');
     assert.equal(statusDuringRun.progress?.pages_processed, 1);
     assert.equal(statusDuringRun.progress?.last_page, 2);
     assert.equal(statusDuringRun.progress?.total_synced, 1);
+    assert.equal(statusDuringRun.units.MT?.in_progress, true);
 
     const statusAfterSuccess = await sync.getSyncStatus();
     assert.equal(statusAfterSuccess.in_progress, false);
@@ -476,11 +786,173 @@ describe('SyncService (17 tables UNNEST, concurrency lock, watermark, and retry)
     assert.ok(statusAfterSuccess.last_completed_at);
     assert.equal(statusAfterSuccess.last_result?.totalSynced, 2);
     assert.equal(statusAfterSuccess.last_error, null);
+    assert.equal(statusAfterSuccess.units.MT?.last_result?.totalSynced, 2);
 
     shouldFail = true;
     await assert.rejects(() => sync.syncLeads());
     const statusAfterError = await sync.getSyncStatus();
     assert.equal(statusAfterError.in_progress, false);
     assert.ok(statusAfterError.last_error?.includes('HTTP 400'));
+    assert.ok(statusAfterError.units.MT?.last_error?.includes('HTTP 400'));
+  });
+
+  it('PostgresSyncStateStore reads/writes per-unit watermark in public.sync_state', async () => {
+    const table = new Map<string, Record<string, unknown>>();
+    const mockDb = {
+      query: async (sql: string, params: any[] = []) => {
+        if (sql.includes('FROM sync_state')) {
+          const row = table.get(String(params[0]));
+          return { rows: row ? [row] : [] };
+        }
+        if (sql.includes('INSERT INTO sync_state')) {
+          table.set(String(params[0]), {
+            pending_start_date: params[1],
+            last_completed_at: params[2],
+            last_start_date: params[3],
+          });
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [] };
+      },
+    };
+
+    const store = new PostgresSyncStateStore(mockDb);
+    assert.equal(await store.read('PA'), null);
+
+    await store.write('PA', {
+      pending_start_date: '2026-11-26 08:00:00',
+      last_completed_at: null,
+      last_start_date: null,
+    });
+
+    const loadedPa = await store.read('PA');
+    assert.deepEqual(loadedPa, {
+      pending_start_date: '2026-11-26 08:00:00',
+      last_completed_at: null,
+      last_start_date: null,
+    });
+    assert.equal(await store.read('AP'), null);
+  });
+
+  it('isolates errors across MT/PA/AP, supports ?unidade= filtering, and rejects only when all units fail', async () => {
+    const stateStore = new MemorySyncStateStore();
+    const maxQueryUnits: string[] = [];
+    const insertedLeadUnits: string[] = [];
+
+    const db: DbPoolLike = {
+      query: async (sql, params) => {
+        if (sql.includes('MAX(updated_at)')) {
+          const unit = String(params?.[0]);
+          maxQueryUnits.push(unit);
+          const dateByUnit: Record<string, string> = {
+            MT: '2026-11-25 08:00:00',
+            PA: '2026-11-20 08:00:00',
+            AP: '2026-11-22 08:00:00',
+          };
+          return { rows: [{ start_date: dateByUnit[unit] }] };
+        }
+        return { rows: [] };
+      },
+      connect: async () => ({
+        query: async (sql, params) => {
+          if (sql.includes('INSERT INTO leads (')) {
+            insertedLeadUnits.push(...(params?.[22] ?? []));
+          }
+          return { rows: [] };
+        },
+        release: () => undefined,
+      }),
+    };
+
+    let paShouldFail = true;
+    let mtShouldFail = false;
+    let apShouldFail = false;
+
+    const authManager = createMockMultiUnitAuthManager({
+      MT: {
+        authenticatedFetch: async () =>
+          mtShouldFail
+            ? new Response('mt down', { status: 500 })
+            : new Response(
+                JSON.stringify({
+                  data: [makeSampleLead(10)],
+                  meta: { current_page: 1, last_page: 1, total: 1 },
+                }),
+                { status: 200 }
+              ),
+      },
+      PA: {
+        authenticatedFetch: async () =>
+          paShouldFail
+            ? Promise.reject(
+                new AppError(503, 'PA sem refresh token', 'MISSING_REFRESH_TOKEN')
+              )
+            : new Response(
+                JSON.stringify({
+                  data: [makeSampleLead(20)],
+                  meta: { current_page: 1, last_page: 1, total: 1 },
+                }),
+                { status: 200 }
+              ),
+      },
+      AP: {
+        authenticatedFetch: async () =>
+          apShouldFail
+            ? new Response('ap down', { status: 500 })
+            : new Response(
+                JSON.stringify({
+                  data: [makeSampleLead(30)],
+                  meta: { current_page: 1, last_page: 1, total: 1 },
+                }),
+                { status: 200 }
+              ),
+      },
+    });
+
+    const sync = new SyncService({
+      db,
+      authManager,
+      stateStore,
+      pageDelayMs: 0,
+      maxRetries: 0,
+      logger: silentLogger,
+    });
+
+    // PA falha, mas MT e AP concluem -> partial_failure = true
+    const partialRes = await sync.syncLeads();
+    assert.equal(partialRes.success, true);
+    assert.equal(partialRes.partial_failure, true);
+    assert.equal(partialRes.totalSynced, 2);
+    assert.equal(partialRes.units.MT?.success, true);
+    assert.equal(partialRes.units.PA?.success, false);
+    assert.equal(partialRes.units.AP?.success, true);
+    assert.deepEqual(maxQueryUnits, ['MT', 'PA', 'AP']);
+    assert.deepEqual(insertedLeadUnits, ['MT', 'AP']);
+
+    // Watermark de PA preservado em pending_start_date enquanto MT e AP avançaram
+    const paState = await stateStore.read('PA');
+    const mtState = await stateStore.read('MT');
+    const apState = await stateStore.read('AP');
+    assert.equal(paState?.pending_start_date, '2026-11-20 08:00:00');
+    assert.equal(mtState?.pending_start_date, null);
+    assert.equal(apState?.pending_start_date, null);
+
+    // ?unidade=PA roda apenas PA e retoma do pending_start_date
+    paShouldFail = false;
+    const paOnlyRes = await sync.syncLeads(undefined, false, 'PA');
+    assert.equal(paOnlyRes.success, true);
+    assert.equal(paOnlyRes.partial_failure, undefined);
+    assert.equal(paOnlyRes.totalSynced, 1);
+    assert.equal(paOnlyRes.resumedFromPending, true);
+    assert.deepEqual(Object.keys(paOnlyRes.units), ['PA']);
+
+    // Todas falham -> lança SYNC_ALL_UNITS_FAILED
+    mtShouldFail = true;
+    paShouldFail = true;
+    apShouldFail = true;
+    await assert.rejects(
+      () => sync.syncLeads(),
+      (err) => err instanceof AppError && err.statusCode === 502 && err.code === 'SYNC_ALL_UNITS_FAILED'
+    );
   });
 });

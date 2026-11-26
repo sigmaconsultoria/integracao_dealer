@@ -49,6 +49,42 @@ function parseCronSchedules(raw: string): string[] {
     .filter(Boolean);
 }
 
+export const UNIT_CODE_REGEX = /^[A-Z0-9_-]{2,10}$/;
+
+export interface FollowizeUnitConfig {
+  unidade: string;
+  clientId: string;
+  clientSecret: string;
+  seedRefreshToken?: string;
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function optionalEnvString() {
+  return z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().trim().min(1).optional()
+  );
+}
+
+export function parseFollowizeUnits(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === '') {
+    return ['MT'];
+  }
+  return Array.from(
+    new Set(
+      raw
+        .split(',')
+        .map((unit) => unit.trim().toUpperCase())
+        .filter(Boolean)
+    )
+  );
+}
+
 export const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -75,12 +111,10 @@ export const envSchema = z
     DB_PASSWORD: z.string().min(1, 'DB_PASSWORD é obrigatório'),
     DB_SSL: envBoolean(false),
 
-    FOLLOWIZE_CLIENT_ID: z.string().trim().min(1, 'FOLLOWIZE_CLIENT_ID é obrigatório'),
-    FOLLOWIZE_CLIENT_SECRET: z.string().trim().min(1, 'FOLLOWIZE_CLIENT_SECRET é obrigatório'),
-    FOLLOWIZE_REFRESH_TOKEN: z.preprocess(
-      (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
-      z.string().trim().min(1).optional()
-    ),
+    FOLLOWIZE_UNITS: z.string().optional(),
+    FOLLOWIZE_CLIENT_ID: optionalEnvString(),
+    FOLLOWIZE_CLIENT_SECRET: optionalEnvString(),
+    FOLLOWIZE_REFRESH_TOKEN: optionalEnvString(),
     FOLLOWIZE_TOKEN_CACHE_PATH: z.string().trim().min(1).default('.runtime/followize-token.json'),
     FOLLOWIZE_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
 
@@ -137,9 +171,81 @@ export const envSchema = z
 
 export function parseEnv(source: Record<string, string | undefined>) {
   const parsed = envSchema.safeParse(source);
+  const fieldErrors: Record<string, string[]> = {};
 
   if (!parsed.success) {
-    console.error('❌ Variáveis de ambiente inválidas:', z.flattenError(parsed.error).fieldErrors);
+    const flattened = z.flattenError(parsed.error).fieldErrors;
+    for (const [key, messages] of Object.entries(flattened)) {
+      if (Array.isArray(messages) && messages.length > 0) {
+        fieldErrors[key] = [...messages];
+      }
+    }
+  }
+
+  const rawUnits = source.FOLLOWIZE_UNITS;
+  const units = parseFollowizeUnits(rawUnits);
+  if (rawUnits !== undefined && rawUnits.trim() !== '' && units.length === 0) {
+    fieldErrors.FOLLOWIZE_UNITS = [
+      'FOLLOWIZE_UNITS deve conter ao menos uma unidade válida (ex: MT,PA,AP)',
+    ];
+  }
+
+  const validUnits: string[] = [];
+  for (const unit of units) {
+    if (!UNIT_CODE_REGEX.test(unit)) {
+      fieldErrors.FOLLOWIZE_UNITS = [
+        ...(fieldErrors.FOLLOWIZE_UNITS ?? []),
+        `Unidade inválida em FOLLOWIZE_UNITS: "${unit}" (use 2-10 caracteres [A-Z0-9_-])`,
+      ];
+    } else {
+      validUnits.push(unit);
+    }
+  }
+
+  const FOLLOWIZE_CLIENTS: Record<string, FollowizeUnitConfig> = {};
+  for (const unit of validUnits) {
+    const clientIdKey = `FOLLOWIZE_${unit}_CLIENT_ID`;
+    const clientSecretKey = `FOLLOWIZE_${unit}_CLIENT_SECRET`;
+    const refreshTokenKey = `FOLLOWIZE_${unit}_REFRESH_TOKEN`;
+
+    const clientId =
+      nonEmpty(source[clientIdKey]) ??
+      (unit === 'MT' ? nonEmpty(source.FOLLOWIZE_CLIENT_ID) : undefined);
+    const clientSecret =
+      nonEmpty(source[clientSecretKey]) ??
+      (unit === 'MT' ? nonEmpty(source.FOLLOWIZE_CLIENT_SECRET) : undefined);
+    const seedRefreshToken =
+      nonEmpty(source[refreshTokenKey]) ??
+      (unit === 'MT' ? nonEmpty(source.FOLLOWIZE_REFRESH_TOKEN) : undefined);
+
+    if (!clientId) {
+      fieldErrors[clientIdKey] = [
+        unit === 'MT'
+          ? `${clientIdKey} (ou fallback FOLLOWIZE_CLIENT_ID) é obrigatório`
+          : `${clientIdKey} é obrigatório`,
+      ];
+    }
+
+    if (!clientSecret) {
+      fieldErrors[clientSecretKey] = [
+        unit === 'MT'
+          ? `${clientSecretKey} (ou fallback FOLLOWIZE_CLIENT_SECRET) é obrigatório`
+          : `${clientSecretKey} é obrigatório`,
+      ];
+    }
+
+    if (clientId && clientSecret) {
+      FOLLOWIZE_CLIENTS[unit] = {
+        unidade: unit,
+        clientId,
+        clientSecret,
+        ...(seedRefreshToken ? { seedRefreshToken } : {}),
+      };
+    }
+  }
+
+  if (!parsed.success || Object.keys(fieldErrors).length > 0) {
+    console.error('❌ Variáveis de ambiente inválidas:', fieldErrors);
     throw new Error('Variáveis de ambiente inválidas');
   }
 
@@ -157,6 +263,8 @@ export function parseEnv(source: Record<string, string | undefined>) {
     CORS_ORIGINS,
     VALID_API_KEYS,
     SYNC_CRON_SCHEDULES,
+    FOLLOWIZE_UNITS: validUnits,
+    FOLLOWIZE_CLIENTS,
   };
 }
 

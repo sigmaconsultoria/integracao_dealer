@@ -1,39 +1,78 @@
-import { createHash, randomUUID } from 'node:crypto';
-import fs from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { env } from '../config/env.js';
+import { pool } from '../config/database.js';
+import { env, type FollowizeUnitConfig } from '../config/env.js';
 import { logger as defaultLogger, type AppLogger } from '../config/logger.js';
 import { AppError } from '../errors/app-error.js';
+import type { DbPoolLike } from '../modules/leads/leads.service.js';
+import {
+  FileTokenStore,
+  MemoryTokenStore,
+  PostgresTokenStore,
+  type TokenCacheState,
+  type TokenStore,
+  type TokenStoreKind,
+} from './token-store.js';
+
+export type AccountOwnershipValidator = (
+  unidade: string,
+  account: AccountVerificationResult
+) => Promise<void>;
 
 export interface AuthServiceConfig {
+  unidade?: string;
   clientId: string;
   clientSecret: string;
   seedRefreshToken?: string;
-  cachePath: string;
+  tokenStore?: TokenStore;
+  cachePath?: string;
   timeoutMs: number;
   tokenUrl?: string;
+  apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
   refreshCooldownMs?: number;
   expirySkewMs?: number;
+  validateAccountOwnership?: AccountOwnershipValidator;
   logger?: Pick<AppLogger, 'warn' | 'error'>;
 }
 
 export interface TokenStatusSummary {
+  unidade: string;
   has_refresh_token: boolean;
   has_valid_access_token: boolean;
   access_token_expires_at: string | null;
   source: 'env' | 'api' | 'none';
   updated_at: string | null;
-  cache_path: string;
+  storage: TokenStoreKind;
 }
 
-interface TokenCacheState {
-  seed_hash: string;
-  access_token: string;
-  refresh_token: string;
-  expires_at: number;
-  source?: 'env' | 'api';
-  updated_at?: string;
+export interface AccountVerificationResult {
+  unidade: string;
+  locations: Array<{ id: number; name: string }>;
+  teams: Array<{ id: number; name: string }>;
+}
+
+export interface AuthClientWithVerify {
+  authenticatedFetch(url: string, options?: RequestInit): Promise<Response>;
+  getAuthorizeUrl(redirectUri: string): string;
+  getTokenStatus(): Promise<TokenStatusSummary>;
+  updateRefreshToken(params: {
+    refreshToken: string;
+    accessToken?: string;
+    expiresIn?: number;
+    validateNow?: boolean;
+  }): Promise<TokenStatusSummary>;
+  exchangeAuthorizationCode(codeOrUrl: string, redirectUri: string): Promise<TokenStatusSummary>;
+  verifyAccount(): Promise<AccountVerificationResult>;
+}
+
+export interface AuthManagerLike {
+  getUnits(): string[];
+  hasUnit(unidade: string): boolean;
+  resolveUnit(unidade?: string, options?: { allowSingleDefault?: boolean }): string;
+  getClient(unidade: string): AuthClientWithVerify;
+  getTokenStatus(unidade: string): Promise<TokenStatusSummary>;
+  getAllTokenStatuses(): Promise<Record<string, TokenStatusSummary>>;
 }
 
 interface TokenApiResponse {
@@ -45,6 +84,7 @@ interface TokenApiResponse {
 
 const DEFAULT_TOKEN_URL = 'https://auth.followize.com.br/oauth/token';
 const DEFAULT_AUTHORIZE_URL = 'https://auth.followize.com.br/oauth/authorize';
+const DEFAULT_API_BASE_URL = 'https://api.followize.com.br/v3';
 const DEFAULT_REFRESH_COOLDOWN_MS = 15_000;
 const DEFAULT_EXPIRY_SKEW_MS = 60_000;
 
@@ -112,13 +152,108 @@ function extractAuthorizationCode(codeOrUrl: string): string {
   return trimmed;
 }
 
-export class AuthService {
+function parseAccountItems(json: unknown): Array<{ id: number; name: string }> {
+  const items = Array.isArray((json as { data?: unknown })?.data)
+    ? (json as { data: Array<{ id?: unknown; name?: unknown }> }).data
+    : [];
+
+  const seen = new Set<number>();
+  const result: Array<{ id: number; name: string }> = [];
+
+  for (const item of items) {
+    const id = Number(item?.id);
+    if (!Number.isInteger(id) || id <= 0 || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const name = typeof item?.name === 'string' && item.name.trim() ? item.name.trim() : String(id);
+    result.push({ id, name });
+  }
+
+  return result;
+}
+
+interface OwnershipConflictRow {
+  id: number | string;
+  name: string | null;
+  unidade: string;
+}
+
+/**
+ * Valida se as lojas e equipes retornadas por um token OAuth2 não pertencem a outra unidade
+ * já cadastrada no PostgreSQL, evitando sobrescrita acidental entre estados.
+ */
+export function createDbAccountOwnershipValidator(
+  db: Pick<DbPoolLike, 'query'>
+): AccountOwnershipValidator {
+  return async (unidade: string, account: AccountVerificationResult) => {
+    const normalizedUnit = unidade.trim().toUpperCase();
+    const locationIds = Array.from(
+      new Set(account.locations.map((l) => l.id).filter((id) => Number.isInteger(id) && id > 0))
+    );
+    const teamIds = Array.from(
+      new Set(account.teams.map((t) => t.id).filter((id) => Number.isInteger(id) && id > 0))
+    );
+
+    const [locRes, teamRes] = await Promise.all([
+      locationIds.length > 0
+        ? db.query<OwnershipConflictRow>(
+            `SELECT id, name, unidade FROM locations WHERE id = ANY($1::bigint[]) AND unidade <> $2 LIMIT 5;`,
+            [locationIds, normalizedUnit]
+          )
+        : Promise.resolve({ rows: [] as OwnershipConflictRow[] }),
+      teamIds.length > 0
+        ? db.query<OwnershipConflictRow>(
+            `SELECT id, name, unidade FROM teams WHERE id = ANY($1::bigint[]) AND unidade <> $2 LIMIT 5;`,
+            [teamIds, normalizedUnit]
+          )
+        : Promise.resolve({ rows: [] as OwnershipConflictRow[] }),
+    ]);
+
+    const locRows = Array.isArray(locRes?.rows) ? locRes.rows : [];
+    const teamRows = Array.isArray(teamRes?.rows) ? teamRes.rows : [];
+    if (locRows.length === 0 && teamRows.length === 0) {
+      return;
+    }
+
+    const conflictUnits = Array.from(
+      new Set(
+        [...locRows, ...teamRows]
+          .map((r) => String(r.unidade || '').trim().toUpperCase())
+          .filter(Boolean)
+      )
+    );
+
+    const detailsParts: string[] = [];
+    if (locRows.length > 0) {
+      detailsParts.push(
+        `lojas: ${locRows.map((r) => `[${r.id}] ${r.name ?? r.id} (${r.unidade})`).join(', ')}`
+      );
+    }
+    if (teamRows.length > 0) {
+      detailsParts.push(
+        `equipes: ${teamRows.map((r) => `[${r.id}] ${r.name ?? r.id} (${r.unidade})`).join(', ')}`
+      );
+    }
+
+    throw new AppError(
+      409,
+      `Trava de segurança: o token informado para a unidade ${normalizedUnit} pertence a outra unidade já cadastrada no banco (${conflictUnits.join(', ')}). Conflitos detectados: ${detailsParts.join('; ')}. Nenhum token foi alterado.`,
+      'TOKEN_UNIT_MISMATCH'
+    );
+  };
+}
+
+export class AuthService implements AuthClientWithVerify {
+  public readonly unidade: string;
   private readonly tokenUrl: string;
+  private readonly apiBaseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly refreshCooldownMs: number;
   private readonly expirySkewMs: number;
   private readonly seedRefreshToken: string;
   private readonly seedHash: string;
+  private readonly tokenStore: TokenStore;
   private readonly logger: Pick<AppLogger, 'warn' | 'error'>;
 
   private state: TokenCacheState | null = null;
@@ -127,13 +262,20 @@ export class AuthService {
   private lastRefreshedAt = 0;
 
   constructor(private readonly config: AuthServiceConfig) {
+    this.unidade = (config.unidade?.trim() || 'MT').toUpperCase();
     this.tokenUrl = config.tokenUrl ?? DEFAULT_TOKEN_URL;
+    this.apiBaseUrl = (config.apiBaseUrl ?? DEFAULT_API_BASE_URL).replace(/\/+$/, '');
     this.fetchImpl = config.fetchImpl ?? globalThis.fetch;
     this.refreshCooldownMs = config.refreshCooldownMs ?? DEFAULT_REFRESH_COOLDOWN_MS;
     this.expirySkewMs = config.expirySkewMs ?? DEFAULT_EXPIRY_SKEW_MS;
     this.seedRefreshToken = config.seedRefreshToken?.trim() ?? '';
     this.seedHash = sha256Hex(this.seedRefreshToken);
     this.logger = config.logger ?? defaultLogger;
+    this.tokenStore =
+      config.tokenStore ??
+      (config.cachePath
+        ? new FileTokenStore(config.cachePath, this.logger)
+        : new MemoryTokenStore());
   }
 
   private createSeedState(): TokenCacheState {
@@ -142,8 +284,8 @@ export class AuthService {
       access_token: '',
       refresh_token: this.seedRefreshToken,
       expires_at: 0,
-      source: this.seedRefreshToken ? 'env' : undefined,
-      updated_at: undefined,
+      source: this.seedRefreshToken ? 'env' : 'none',
+      updated_at: null,
     };
   }
 
@@ -157,75 +299,80 @@ export class AuthService {
   }
 
   /**
-   * Carrega o estado em cache se pertencer ao mesmo seedRefreshToken do .env;
-   * caso contrário, inicializa a partir do .env.
+   * Carrega o estado do TokenStore respeitando o seed do .env.
+   * Quando forceReload=true, relê do store para detectar tokens rotacionados por outra instância.
    */
-  private async loadState(): Promise<TokenCacheState> {
-    if (this.state) {
+  private async loadState(forceReload = false): Promise<TokenCacheState> {
+    if (!forceReload && this.state) {
       return this.state;
     }
 
-    if (this.loadStatePromise) {
+    if (!forceReload && this.loadStatePromise) {
       return this.loadStatePromise;
     }
 
-    this.loadStatePromise = (async () => {
+    const executeLoad = async (): Promise<TokenCacheState> => {
       try {
-        const raw = await fs.readFile(this.config.cachePath, 'utf-8');
-        const parsed = JSON.parse(raw) as Partial<TokenCacheState>;
+        const expectedSeedHash = this.seedRefreshToken ? this.seedHash : undefined;
+        const stored = await this.tokenStore.load(this.unidade, expectedSeedHash);
 
         if (
-          parsed &&
-          parsed.seed_hash === this.seedHash &&
-          typeof parsed.refresh_token === 'string' &&
-          parsed.refresh_token.trim().length > 0 &&
-          typeof parsed.access_token === 'string' &&
-          typeof parsed.expires_at === 'number' &&
-          Number.isFinite(parsed.expires_at)
+          stored &&
+          stored.refresh_token.trim().length > 0 &&
+          (!this.seedRefreshToken || stored.seed_hash === this.seedHash)
         ) {
           this.state = {
-            seed_hash: this.seedHash,
-            access_token: parsed.access_token,
-            refresh_token: parsed.refresh_token.trim(),
-            expires_at: parsed.expires_at,
-            source: parsed.source === 'api' || parsed.source === 'env' ? parsed.source : 'env',
-            updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : undefined,
+            seed_hash: this.seedHash || stored.seed_hash,
+            access_token: stored.access_token,
+            refresh_token: stored.refresh_token.trim(),
+            expires_at: stored.expires_at,
+            source: stored.source === 'api' || stored.source === 'env' ? stored.source : 'env',
+            updated_at: stored.updated_at,
           };
           return this.state;
         }
-      } catch {
-        // Cache ausente ou corrompido: inicializa limpo a partir do seed do .env
+      } catch (err) {
+        this.logger.warn(
+          {
+            unidade: this.unidade,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'Falha ao carregar estado de token do TokenStore'
+        );
+        if (this.state) {
+          return this.state;
+        }
+      }
+
+      if (forceReload && this.state) {
+        return this.state;
       }
 
       this.state = this.createSeedState();
       return this.state;
-    })().finally(() => {
+    };
+
+    if (forceReload) {
+      return executeLoad();
+    }
+
+    this.loadStatePromise = executeLoad().finally(() => {
       this.loadStatePromise = null;
     });
 
     return this.loadStatePromise;
   }
 
-  /**
-   * Persiste o estado atualizado em arquivo temporário + rename atômico (modo 0600).
-   * Falhas de escrita em disco não derrubam a operação em memória.
-   */
-  private async saveStateAtomically(state: TokenCacheState): Promise<void> {
-    const dir = path.dirname(this.config.cachePath);
-    const tmpPath = `${this.config.cachePath}.${process.pid}.${randomUUID()}.tmp`;
-
+  private async persistState(state: TokenCacheState): Promise<void> {
     try {
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), {
-        encoding: 'utf-8',
-        mode: 0o600,
-      });
-      await fs.rename(tmpPath, this.config.cachePath);
+      await this.tokenStore.save(this.unidade, state);
     } catch (err) {
-      await fs.unlink(tmpPath).catch(() => undefined);
       this.logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Falha ao persistir cache de token em disco; operando apenas em memória'
+        {
+          unidade: this.unidade,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'Falha ao persistir token no TokenStore; operando apenas em memória'
       );
     }
   }
@@ -240,22 +387,27 @@ export class AuthService {
   }
 
   async getTokenStatus(): Promise<TokenStatusSummary> {
-    const state = await this.loadState();
+    const state = await this.loadState(this.tokenStore.storageKind === 'postgres');
     const hasRefresh = Boolean(state.refresh_token);
     const hasValidAccess = this.isAccessTokenFresh(state);
     const expiresAt =
       state.access_token && state.expires_at > 0
         ? new Date(state.expires_at).toISOString()
         : null;
-    const source: 'env' | 'api' | 'none' = !hasRefresh ? 'none' : (state.source ?? 'env');
+    const source: 'env' | 'api' | 'none' = !hasRefresh
+      ? 'none'
+      : state.source === 'none'
+        ? 'env'
+        : state.source;
 
     return {
+      unidade: this.unidade,
       has_refresh_token: hasRefresh,
       has_valid_access_token: hasValidAccess,
       access_token_expires_at: expiresAt,
       source,
       updated_at: state.updated_at ?? null,
-      cache_path: this.config.cachePath,
+      storage: this.tokenStore.storageKind,
     };
   }
 
@@ -291,7 +443,7 @@ export class AuthService {
       if (!response.ok) {
         throw new AppError(
           400,
-          `Falha ao validar o novo refresh_token na Followize (HTTP ${response.status})`,
+          `Falha ao validar o novo refresh_token da unidade ${this.unidade} na Followize (HTTP ${response.status})`,
           'OAUTH_REFRESH_FAILED'
         );
       }
@@ -306,6 +458,12 @@ export class AuthService {
       }
 
       const accessToken = refreshedData.access_token.trim();
+
+      if (this.config.validateAccountOwnership) {
+        const account = await this.verifyAccountWithToken(accessToken);
+        await this.config.validateAccountOwnership(this.unidade, account);
+      }
+
       const nextState: TokenCacheState = {
         seed_hash: this.seedHash,
         access_token: accessToken,
@@ -320,7 +478,7 @@ export class AuthService {
 
       this.state = nextState;
       this.lastRefreshedAt = Date.now();
-      await this.saveStateAtomically(nextState);
+      await this.persistState(nextState);
       return this.getTokenStatus();
     }
 
@@ -338,7 +496,7 @@ export class AuthService {
 
     this.state = nextState;
     this.lastRefreshedAt = 0;
-    await this.saveStateAtomically(nextState);
+    await this.persistState(nextState);
 
     return this.getTokenStatus();
   }
@@ -370,7 +528,7 @@ export class AuthService {
     if (!response.ok) {
       throw new AppError(
         400,
-        `Falha ao trocar authorization code na Followize (HTTP ${response.status})`,
+        `Falha ao trocar authorization code da unidade ${this.unidade} na Followize (HTTP ${response.status})`,
         'OAUTH_EXCHANGE_FAILED'
       );
     }
@@ -392,6 +550,11 @@ export class AuthService {
     const accessToken = data.access_token.trim();
     const refreshToken = data.refresh_token.trim();
 
+    if (this.config.validateAccountOwnership) {
+      const account = await this.verifyAccountWithToken(accessToken);
+      await this.config.validateAccountOwnership(this.unidade, account);
+    }
+
     const nextState: TokenCacheState = {
       seed_hash: this.seedHash,
       access_token: accessToken,
@@ -403,14 +566,15 @@ export class AuthService {
 
     this.state = nextState;
     this.lastRefreshedAt = Date.now();
-    await this.saveStateAtomically(nextState);
+    await this.persistState(nextState);
 
     return this.getTokenStatus();
   }
 
   /**
    * Renova o access_token usando o refresh_token atual com lock single-flight.
-   * Chamadas concorrentes compartilham a mesma requisição OAuth2.
+   * Recarrega o TokenStore antes de disparar o refresh OAuth2 para evitar sobrescrever tokens
+   * recém-rotacionados por outra instância.
    */
   async refreshToken(failedAccessToken?: string): Promise<string> {
     if (this.refreshPromise) {
@@ -428,7 +592,7 @@ export class AuthService {
     }
 
     this.refreshPromise = (async () => {
-      const currentState = await this.loadState();
+      const currentState = await this.loadState(true);
 
       if (
         failedAccessToken &&
@@ -442,7 +606,7 @@ export class AuthService {
       if (!currentState.refresh_token) {
         throw new AppError(
           503,
-          'FOLLOWIZE_REFRESH_TOKEN não configurado. Envie um novo token via POST /auth/followize/refresh-token.',
+          `Refresh token da unidade ${this.unidade} não configurado. Envie um novo token via POST /auth/followize/refresh-token.`,
           'MISSING_REFRESH_TOKEN'
         );
       }
@@ -466,7 +630,9 @@ export class AuthService {
 
       if (!response.ok) {
         const errText = await response.text().catch(() => '');
-        throw new Error(`Falha ao renovar token Followize (${response.status}): ${errText}`);
+        throw new Error(
+          `Falha ao renovar token Followize da unidade ${this.unidade} (${response.status}): ${errText}`
+        );
       }
 
       const refreshedData = (await response.json()) as Partial<TokenApiResponse>;
@@ -482,13 +648,13 @@ export class AuthService {
             ? refreshedData.refresh_token.trim()
             : currentState.refresh_token,
         expires_at: computeExpiresAt(refreshedData.access_token, refreshedData.expires_in),
-        source: currentState.source ?? 'env',
+        source: currentState.source === 'none' ? 'env' : currentState.source,
         updated_at: new Date().toISOString(),
       };
 
       this.state = nextState;
       this.lastRefreshedAt = Date.now();
-      await this.saveStateAtomically(nextState);
+      await this.persistState(nextState);
 
       return nextState.access_token;
     })().finally(() => {
@@ -499,7 +665,7 @@ export class AuthService {
   }
 
   /**
-   * Retorna um access_token válido da memória/cache ou renova proativamente antes da expiração.
+   * Retorna um access_token válido da memória/store ou renova proativamente antes da expiração.
    */
   async getValidToken(forceRefresh = false): Promise<string> {
     if (forceRefresh) {
@@ -548,12 +714,169 @@ export class AuthService {
 
     return response;
   }
+
+  private async fetchAccountVerification(
+    fetcher: (url: string) => Promise<Response>
+  ): Promise<AccountVerificationResult> {
+    const [locRes, teamRes] = await Promise.all([
+      fetcher(`${this.apiBaseUrl}/locations?page=1&per_page=100`),
+      fetcher(`${this.apiBaseUrl}/teams?page=1&per_page=100`),
+    ]);
+
+    if (!locRes.ok) {
+      throw new AppError(
+        502,
+        `Falha ao consultar lojas da unidade ${this.unidade} na Followize (HTTP ${locRes.status})`,
+        'UPSTREAM_ERROR'
+      );
+    }
+
+    if (!teamRes.ok) {
+      throw new AppError(
+        502,
+        `Falha ao consultar equipes da unidade ${this.unidade} na Followize (HTTP ${teamRes.status})`,
+        'UPSTREAM_ERROR'
+      );
+    }
+
+    const [locJson, teamJson] = await Promise.all([
+      locRes.json().catch(() => null),
+      teamRes.json().catch(() => null),
+    ]);
+
+    return {
+      unidade: this.unidade,
+      locations: parseAccountItems(locJson),
+      teams: parseAccountItems(teamJson),
+    };
+  }
+
+  private async verifyAccountWithToken(accessToken: string): Promise<AccountVerificationResult> {
+    return this.fetchAccountVerification((url) =>
+      this.fetchImpl(url, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+        signal: this.buildRequestSignal(),
+      })
+    );
+  }
+
+  /**
+   * Consulta lojas (/v3/locations) e equipes (/v3/teams) desta credencial
+   * para confirmar visualmente qual conta regional está vinculada à unidade.
+   */
+  async verifyAccount(): Promise<AccountVerificationResult> {
+    return this.fetchAccountVerification((url) => this.authenticatedFetch(url));
+  }
 }
 
-export const authService = new AuthService({
-  clientId: env.FOLLOWIZE_CLIENT_ID,
-  clientSecret: env.FOLLOWIZE_CLIENT_SECRET,
-  seedRefreshToken: env.FOLLOWIZE_REFRESH_TOKEN,
-  cachePath: path.resolve(process.cwd(), env.FOLLOWIZE_TOKEN_CACHE_PATH),
+export class AuthManager implements AuthManagerLike {
+  private readonly clients = new Map<string, AuthService>();
+  private readonly orderedUnits: string[] = [];
+
+  constructor(
+    unitConfigs: Record<string, FollowizeUnitConfig>,
+    options: {
+      tokenStore?: TokenStore;
+      timeoutMs?: number;
+      tokenUrl?: string;
+      apiBaseUrl?: string;
+      fetchImpl?: typeof fetch;
+      refreshCooldownMs?: number;
+      expirySkewMs?: number;
+      validateAccountOwnership?: AccountOwnershipValidator;
+      logger?: Pick<AppLogger, 'warn' | 'error'>;
+    } = {}
+  ) {
+    const sharedStore = options.tokenStore ?? new MemoryTokenStore();
+    const timeoutMs = options.timeoutMs ?? env.FOLLOWIZE_TIMEOUT_MS;
+
+    for (const [rawKey, unitConfig] of Object.entries(unitConfigs)) {
+      const unidade = (unitConfig.unidade || rawKey).trim().toUpperCase();
+      if (!unidade || this.clients.has(unidade)) {
+        continue;
+      }
+
+      this.orderedUnits.push(unidade);
+      this.clients.set(
+        unidade,
+        new AuthService({
+          unidade,
+          clientId: unitConfig.clientId,
+          clientSecret: unitConfig.clientSecret,
+          seedRefreshToken: unitConfig.seedRefreshToken,
+          tokenStore: sharedStore,
+          timeoutMs,
+          tokenUrl: options.tokenUrl,
+          apiBaseUrl: options.apiBaseUrl,
+          fetchImpl: options.fetchImpl,
+          refreshCooldownMs: options.refreshCooldownMs,
+          expirySkewMs: options.expirySkewMs,
+          validateAccountOwnership: options.validateAccountOwnership,
+          logger: options.logger,
+        })
+      );
+    }
+  }
+
+  getUnits(): string[] {
+    return [...this.orderedUnits];
+  }
+
+  hasUnit(unidade: string): boolean {
+    return this.clients.has(unidade.trim().toUpperCase());
+  }
+
+  resolveUnit(unidade?: string, options: { allowSingleDefault?: boolean } = {}): string {
+    const allowSingleDefault = options.allowSingleDefault ?? false;
+    const normalized = typeof unidade === 'string' ? unidade.trim().toUpperCase() : '';
+
+    if (!normalized) {
+      if (allowSingleDefault && this.orderedUnits.length === 1) {
+        return this.orderedUnits[0]!;
+      }
+
+      throw new AppError(
+        400,
+        `Parâmetro unidade é obrigatório (${this.orderedUnits.join(', ')})`,
+        'UNIT_REQUIRED'
+      );
+    }
+
+    if (!this.clients.has(normalized)) {
+      throw new AppError(
+        400,
+        `Unidade "${normalized}" não configurada. Unidades disponíveis: ${this.orderedUnits.join(', ')}`,
+        'INVALID_UNIT'
+      );
+    }
+
+    return normalized;
+  }
+
+  getClient(unidade: string): AuthService {
+    const resolved = this.resolveUnit(unidade, { allowSingleDefault: false });
+    return this.clients.get(resolved)!;
+  }
+
+  async getTokenStatus(unidade: string): Promise<TokenStatusSummary> {
+    return this.getClient(unidade).getTokenStatus();
+  }
+
+  async getAllTokenStatuses(): Promise<Record<string, TokenStatusSummary>> {
+    const entries = await Promise.all(
+      this.orderedUnits.map(async (unidade) => [unidade, await this.getTokenStatus(unidade)] as const)
+    );
+    return Object.fromEntries(entries);
+  }
+}
+
+export const authManager = new AuthManager(env.FOLLOWIZE_CLIENTS, {
+  tokenStore: new PostgresTokenStore(pool, {
+    legacyCachePath: path.resolve(process.cwd(), env.FOLLOWIZE_TOKEN_CACHE_PATH),
+  }),
   timeoutMs: env.FOLLOWIZE_TIMEOUT_MS,
+  validateAccountOwnership: createDbAccountOwnershipValidator(pool),
 });

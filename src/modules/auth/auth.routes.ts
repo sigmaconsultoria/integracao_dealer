@@ -5,6 +5,7 @@ import {
   getFollowizeAuthorizeUrl,
   getFollowizeTokenStatus,
   updateFollowizeRefreshToken,
+  verifyFollowizeAccount,
 } from './auth.controller.js';
 
 export interface AuthRoutesOptions {
@@ -42,5 +43,18 @@ export const authRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (app, opt
       },
     },
     exchangeFollowizeCode
+  );
+
+  app.get(
+    '/followize/verify',
+    {
+      config: {
+        rateLimit: {
+          max: Math.min(10, globalMax),
+          timeWindow: '1 minute',
+        },
+      },
+    },
+    verifyFollowizeAccount
   );
 };

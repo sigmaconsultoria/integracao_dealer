@@ -1,34 +1,67 @@
-import { randomUUID } from 'node:crypto';
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import { pool } from '../config/database.js';
 import { logger as defaultLogger, type AppLogger } from '../config/logger.js';
 import { AppError } from '../errors/app-error.js';
 import type { AuthClientLike, DbClientLike, DbPoolLike } from '../modules/leads/leads.service.js';
-import { authService } from './auth.service.js';
+import { authManager as defaultAuthManager, type AuthManagerLike } from './auth.service.js';
+import {
+  FileSyncStateStore,
+  PostgresSyncStateStore,
+  type SyncStateRecord,
+  type SyncStateStore,
+} from './sync-state-store.js';
 
 const API_URL = 'https://api.followize.com.br/v3/leads';
 const DEFAULT_FALLBACK_DATE = '2026-09-01 00:00:00';
-const DEFAULT_STATE_PATH = path.resolve(process.cwd(), '.runtime/sync-state.json');
 const PER_PAGE = 50;
+
+export type SyncAuthManagerLike = Pick<
+  AuthManagerLike,
+  'getUnits' | 'hasUnit' | 'resolveUnit' | 'getClient'
+>;
+
+export interface UnitSyncResult {
+  unidade: string;
+  success: boolean;
+  startDate: string | null;
+  totalSynced: number;
+  pagesProcessed: number;
+  resumedFromPending: boolean;
+  durationSeconds: number;
+  message: string;
+  error?: string;
+}
 
 export interface SyncResult {
   success: boolean;
+  partial_failure?: boolean;
   startDate: string;
   totalSynced: number;
   pagesProcessed: number;
   resumedFromPending: boolean;
   durationSeconds: number;
   message: string;
+  units: Record<string, UnitSyncResult>;
 }
 
 export interface SyncProgress {
   started_at: string;
+  current_unit: string | null;
   current_page: number;
   last_page: number | null;
   pages_processed: number;
   total_synced: number;
   total_records: number | null;
+}
+
+export interface UnitSyncStatusSnapshot {
+  unidade: string;
+  in_progress: boolean;
+  progress: SyncProgress | null;
+  pending_start_date: string | null;
+  last_completed_at: string | null;
+  last_start_date: string | null;
+  last_result: UnitSyncResult | null;
+  last_error: string | null;
 }
 
 export interface SyncStatusSnapshot {
@@ -38,11 +71,14 @@ export interface SyncStatusSnapshot {
   last_start_date: string | null;
   last_result: SyncResult | null;
   last_error: string | null;
+  units: Record<string, UnitSyncStatusSnapshot>;
 }
 
 export interface SyncServiceDeps {
   db?: DbPoolLike;
+  authManager?: SyncAuthManagerLike;
   auth?: AuthClientLike;
+  stateStore?: SyncStateStore;
   statePath?: string;
   maxPages?: number;
   pageDelayMs?: number;
@@ -51,10 +87,33 @@ export interface SyncServiceDeps {
   logger?: AppLogger;
 }
 
-interface SyncStateFile {
-  pending_start_date: string | null;
-  last_completed_at: string | null;
-  last_start_date: string | null;
+function createSingleUnitAuthManager(authClient: AuthClientLike): SyncAuthManagerLike {
+  return {
+    getUnits: () => ['MT'],
+    hasUnit: (unidade: string) => unidade.trim().toUpperCase() === 'MT',
+    resolveUnit: (unidade?: string) => {
+      const normalized = typeof unidade === 'string' ? unidade.trim().toUpperCase() : '';
+      if (!normalized || normalized === 'MT') {
+        return 'MT';
+      }
+      throw new AppError(
+        400,
+        `Unidade "${normalized}" não configurada. Unidades disponíveis: MT`,
+        'INVALID_UNIT'
+      );
+    },
+    getClient: (unidade: string) => {
+      const normalized = unidade.trim().toUpperCase();
+      if (normalized !== 'MT') {
+        throw new AppError(
+          400,
+          `Unidade "${normalized}" não configurada. Unidades disponíveis: MT`,
+          'INVALID_UNIT'
+        );
+      }
+      return authClient as ReturnType<AuthManagerLike['getClient']>;
+    },
+  };
 }
 
 function toNullableString(val: unknown): string | null {
@@ -141,82 +200,112 @@ function sleep(ms: number): Promise<void> {
 
 export class SyncService {
   private readonly db: DbPoolLike;
-  private readonly auth: AuthClientLike;
-  private readonly statePath: string;
+  private readonly authManager: SyncAuthManagerLike;
+  private readonly stateStore: SyncStateStore;
   private readonly maxPages: number;
   private readonly pageDelayMs: number;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly logger: AppLogger;
 
-  private activeSyncStartedAt: string | null = null;
+  private readonly activeUnits = new Map<string, string>();
+  private readonly unitProgress = new Map<string, SyncProgress>();
+  private readonly unitLastResult = new Map<string, UnitSyncResult>();
+  private readonly unitLastError = new Map<string, string | null>();
   private activeProgress: SyncProgress | null = null;
   private lastResult: SyncResult | null = null;
   private lastError: string | null = null;
 
   constructor(deps: SyncServiceDeps = {}) {
     this.db = deps.db ?? pool;
-    this.auth = deps.auth ?? authService;
-    this.statePath = deps.statePath ?? DEFAULT_STATE_PATH;
+    this.authManager =
+      deps.authManager ??
+      (deps.auth ? createSingleUnitAuthManager(deps.auth) : defaultAuthManager);
+    this.logger = deps.logger ?? defaultLogger;
+    this.stateStore =
+      deps.stateStore ??
+      (deps.statePath
+        ? new FileSyncStateStore(deps.statePath, this.logger)
+        : new PostgresSyncStateStore(this.db));
     this.maxPages = deps.maxPages ?? 1000;
     this.pageDelayMs = deps.pageDelayMs ?? 150;
     this.maxRetries = deps.maxRetries ?? 3;
     this.retryBaseDelayMs = deps.retryBaseDelayMs ?? 500;
-    this.logger = deps.logger ?? defaultLogger;
   }
 
-  private async readSyncState(): Promise<SyncStateFile | null> {
+  private resolveTargetUnits(unidade?: string): string[] {
+    if (typeof unidade === 'string' && unidade.trim().length > 0) {
+      return [this.authManager.resolveUnit(unidade, { allowSingleDefault: false })];
+    }
+    return this.authManager.getUnits();
+  }
+
+  private assertUnitsAvailable(targetUnits: string[]): void {
+    for (const unit of targetUnits) {
+      const startedAt = this.activeUnits.get(unit);
+      if (startedAt) {
+        throw new AppError(
+          409,
+          `Sincronização já está em andamento para a unidade ${unit} desde ${startedAt}`,
+          'SYNC_IN_PROGRESS'
+        );
+      }
+    }
+  }
+
+  private async safeReadSyncState(unidade: string): Promise<SyncStateRecord | null> {
     try {
-      const raw = await fs.readFile(this.statePath, 'utf-8');
-      const parsed = JSON.parse(raw) as Partial<SyncStateFile>;
-      return {
-        pending_start_date:
-          typeof parsed.pending_start_date === 'string' && parsed.pending_start_date.trim()
-            ? parsed.pending_start_date.trim()
-            : null,
-        last_completed_at:
-          typeof parsed.last_completed_at === 'string' ? parsed.last_completed_at : null,
-        last_start_date:
-          typeof parsed.last_start_date === 'string' ? parsed.last_start_date : null,
-      };
-    } catch {
+      return await this.stateStore.read(unidade);
+    } catch (err) {
+      this.logger.warn(
+        {
+          unidade,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'Falha ao ler estado de watermark da unidade'
+      );
       return null;
     }
   }
 
-  private async writeSyncState(nextState: SyncStateFile): Promise<void> {
-    const dir = path.dirname(this.statePath);
-    const tmpPath = `${this.statePath}.${process.pid}.${randomUUID()}.tmp`;
+  private async safeWriteSyncState(unidade: string, nextState: SyncStateRecord): Promise<void> {
     try {
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(tmpPath, JSON.stringify(nextState, null, 2), {
-        encoding: 'utf-8',
-        mode: 0o600,
-      });
-      await fs.rename(tmpPath, this.statePath);
+      await this.stateStore.write(unidade, nextState);
     } catch (err) {
-      await fs.unlink(tmpPath).catch(() => undefined);
       this.logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Falha ao persistir estado de watermark em disco'
+        {
+          unidade,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'Falha ao persistir estado de watermark da unidade'
       );
     }
   }
 
   /**
-   * Obtém a data/hora inicial de sincronização no fuso 'America/Sao_Paulo'.
+   * Obtém a data/hora inicial de sincronização de uma unidade no fuso 'America/Sao_Paulo'.
    * Se houver sync incremental anterior interrompido, retoma do pending_start_date.
    */
-  async getIncrementalStartDate(customDate?: string, fullSync = false): Promise<string> {
-    const resolved = await this.resolveStartDate(customDate, fullSync);
+  async getIncrementalStartDate(
+    customDate?: string,
+    fullSync = false,
+    unidade = this.authManager.getUnits()[0] ?? 'MT'
+  ): Promise<string> {
+    const resolvedUnit = this.authManager.resolveUnit(unidade, { allowSingleDefault: true });
+    const resolved = await this.resolveStartDate(resolvedUnit, customDate, fullSync);
     return resolved.startDate;
   }
 
   private async resolveStartDate(
+    unidade: string,
     customDate?: string,
     fullSync = false
-  ): Promise<{ startDate: string; resumedFromPending: boolean; prevState: SyncStateFile | null }> {
-    const prevState = await this.readSyncState();
+  ): Promise<{
+    startDate: string;
+    resumedFromPending: boolean;
+    prevState: SyncStateRecord | null;
+  }> {
+    const prevState = await this.safeReadSyncState(unidade);
 
     if (fullSync) {
       return { startDate: DEFAULT_FALLBACK_DATE, resumedFromPending: false, prevState };
@@ -238,13 +327,15 @@ export class SyncService {
       };
     }
 
-    const { rows } = await this.db.query(`
-      SELECT TO_CHAR(
-        (COALESCE(MAX(updated_at), '2026-09-01 00:00:00+00'::timestamptz) AT TIME ZONE 'America/Sao_Paulo') - INTERVAL '3 minutes',
-        'YYYY-MM-DD HH24:MI:SS'
-      ) AS start_date
-      FROM leads;
-    `);
+    const { rows } = await this.db.query(
+      `SELECT TO_CHAR(
+         (COALESCE(MAX(updated_at), '2026-09-01 00:00:00+00'::timestamptz) AT TIME ZONE 'America/Sao_Paulo') - INTERVAL '3 minutes',
+         'YYYY-MM-DD HH24:MI:SS'
+       ) AS start_date
+       FROM leads
+       WHERE unidade = $1;`,
+      [unidade]
+    );
 
     return {
       startDate: rows[0]?.start_date || DEFAULT_FALLBACK_DATE,
@@ -253,7 +344,12 @@ export class SyncService {
     };
   }
 
-  private async fetchPageWithRetry(startDate: string, page: number): Promise<any> {
+  private async fetchPageWithRetry(
+    authClient: AuthClientLike,
+    unidade: string,
+    startDate: string,
+    page: number
+  ): Promise<any> {
     const url = new URL(API_URL);
     url.searchParams.set('date_from', startDate);
     url.searchParams.set('date_field', 'updated_at');
@@ -265,7 +361,7 @@ export class SyncService {
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
-        const res = await this.auth.authenticatedFetch(url.toString(), {
+        const res = await authClient.authenticatedFetch(url.toString(), {
           headers: {
             'User-Agent': 'FollowizeFastifySync/2.0',
           },
@@ -280,22 +376,28 @@ export class SyncService {
         if (!isRetryable || attempt === this.maxRetries) {
           throw new AppError(
             502,
-            `Erro na API Followize (HTTP ${res.status}) na página ${page}`,
+            `Erro na API Followize (HTTP ${res.status}) na página ${page} [${unidade}]`,
             'UPSTREAM_ERROR'
           );
         }
 
         const retryAfterRaw = res.headers.get('retry-after');
-        const retryAfterSec = retryAfterRaw && /^\d+$/.test(retryAfterRaw.trim())
-          ? Number(retryAfterRaw.trim())
-          : null;
+        const retryAfterSec =
+          retryAfterRaw && /^\d+$/.test(retryAfterRaw.trim()) ? Number(retryAfterRaw.trim()) : null;
         const delayMs =
           retryAfterSec !== null
             ? Math.min(retryAfterSec * 1000, 30_000)
             : this.retryBaseDelayMs * 2 ** attempt;
 
         this.logger.warn(
-          { status: res.status, page, delayMs, attempt: attempt + 1, maxRetries: this.maxRetries },
+          {
+            unidade,
+            status: res.status,
+            page,
+            delayMs,
+            attempt: attempt + 1,
+            maxRetries: this.maxRetries,
+          },
           'Erro HTTP transitório ao buscar página na Followize; aguardando retry'
         );
         await sleep(delayMs);
@@ -318,6 +420,7 @@ export class SyncService {
         const delayMs = this.retryBaseDelayMs * 2 ** attempt;
         this.logger.warn(
           {
+            unidade,
             err: err instanceof Error ? err.message : String(err),
             page,
             delayMs,
@@ -332,47 +435,48 @@ export class SyncService {
 
     throw new AppError(
       502,
-      `Falha ao consultar página ${page} da Followize${lastStatus ? ` (HTTP ${lastStatus})` : ''}${lastError instanceof Error ? `: ${lastError.message}` : ''}`,
+      `Falha ao consultar página ${page} da Followize [${unidade}]${lastStatus ? ` (HTTP ${lastStatus})` : ''}${lastError instanceof Error ? `: ${lastError.message}` : ''}`,
       'UPSTREAM_ERROR'
     );
   }
 
-  /**
-   * Executa a sincronização incremental completa nas 17 tabelas com lock anti-concorrência,
-   * retry com backoff, watermark resiliente e UPSERT em lote via UNNEST.
-   */
-  async syncLeads(customDate?: string, fullSync = false): Promise<SyncResult> {
-    if (this.activeSyncStartedAt) {
-      throw new AppError(
-        409,
-        `Sincronização já está em andamento desde ${this.activeSyncStartedAt}`,
-        'SYNC_IN_PROGRESS'
-      );
-    }
-
-    this.activeSyncStartedAt = new Date().toISOString();
-    this.activeProgress = {
-      started_at: this.activeSyncStartedAt,
+  private async syncSingleUnit(
+    unidade: string,
+    startedAt: string,
+    customDate?: string,
+    fullSync = false
+  ): Promise<UnitSyncResult> {
+    const unitStartTime = Date.now();
+    const progress: SyncProgress = {
+      started_at: startedAt,
+      current_unit: unidade,
       current_page: 0,
       last_page: null,
       pages_processed: 0,
       total_synced: 0,
       total_records: null,
     };
-    this.lastError = null;
-    const startTime = Date.now();
+    this.unitProgress.set(unidade, progress);
+    this.activeProgress = progress;
+
+    let resolvedStartDate: string | null = null;
+    let resumedFromPending = false;
+    let totalSynced = 0;
+    let pagesProcessed = 0;
 
     try {
-      const { startDate, resumedFromPending, prevState } = await this.resolveStartDate(
-        customDate,
-        fullSync
-      );
+      const authClient = this.authManager.getClient(unidade);
+      const startInfo = await this.resolveStartDate(unidade, customDate, fullSync);
+      resolvedStartDate = startInfo.startDate;
+      resumedFromPending = startInfo.resumedFromPending;
+      const prevState = startInfo.prevState;
+
       const isIncremental = !customDate && !fullSync;
       const forceUpsert = Boolean(customDate) || fullSync || resumedFromPending;
 
       if (isIncremental) {
-        await this.writeSyncState({
-          pending_start_date: startDate,
+        await this.safeWriteSyncState(unidade, {
+          pending_start_date: resolvedStartDate,
           last_completed_at: prevState?.last_completed_at ?? null,
           last_start_date: prevState?.last_start_date ?? null,
         });
@@ -380,16 +484,19 @@ export class SyncService {
 
       let currentPage = 1;
       let lastPage = 1;
-      let totalSynced = 0;
-      let pagesProcessed = 0;
 
       this.logger.info(
-        { startDate, resumedFromPending },
-        'Iniciando sincronização incremental de leads'
+        { unidade, startDate: resolvedStartDate, resumedFromPending },
+        'Iniciando sincronização incremental de leads da unidade'
       );
 
       while (currentPage <= lastPage) {
-        const json = await this.fetchPageWithRetry(startDate, currentPage);
+        const json = await this.fetchPageWithRetry(
+          authClient,
+          unidade,
+          resolvedStartDate,
+          currentPage
+        );
         const leadsBatch = Array.isArray(json?.data) ? json.data : [];
         const meta = json?.meta || {};
         const parsedLastPage = Number(meta.last_page);
@@ -399,11 +506,9 @@ export class SyncService {
             : currentPage;
         const totalRecords = Number(meta.total ?? leadsBatch.length);
 
-        if (this.activeProgress) {
-          this.activeProgress.current_page = currentPage;
-          this.activeProgress.last_page = lastPage;
-          this.activeProgress.total_records = Number.isFinite(totalRecords) ? totalRecords : null;
-        }
+        progress.current_page = currentPage;
+        progress.last_page = lastPage;
+        progress.total_records = Number.isFinite(totalRecords) ? totalRecords : null;
 
         if (!leadsBatch.length || totalRecords === 0) {
           break;
@@ -412,16 +517,15 @@ export class SyncService {
         const client = await this.db.connect();
         try {
           await client.query('BEGIN');
-          const savedCount = await this.saveBatch(client, leadsBatch, forceUpsert);
+          const savedCount = await this.saveBatch(client, unidade, leadsBatch, forceUpsert);
           await client.query('COMMIT');
           totalSynced += savedCount;
           pagesProcessed++;
-          if (this.activeProgress) {
-            this.activeProgress.pages_processed = pagesProcessed;
-            this.activeProgress.total_synced = totalSynced;
-          }
+          progress.pages_processed = pagesProcessed;
+          progress.total_synced = totalSynced;
           this.logger.info(
             {
+              unidade,
               page: currentPage,
               lastPage,
               savedCount,
@@ -444,101 +548,391 @@ export class SyncService {
       }
 
       if (isIncremental || fullSync) {
-        await this.writeSyncState({
+        await this.safeWriteSyncState(unidade, {
           pending_start_date: null,
           last_completed_at: new Date().toISOString(),
-          last_start_date: startDate,
+          last_start_date: resolvedStartDate,
         });
       }
 
-      const durationSeconds = Math.round((Date.now() - startTime) / 1000);
-
-      const result: SyncResult = {
+      const durationSeconds = Math.round((Date.now() - unitStartTime) / 1000);
+      return {
+        unidade,
         success: true,
-        startDate,
+        startDate: resolvedStartDate,
         totalSynced,
         pagesProcessed,
         resumedFromPending,
         durationSeconds,
-        message: `Sincronização concluída com sucesso. ${totalSynced} leads processados em ${durationSeconds}s.`,
+        message: `Unidade ${unidade} sincronizada com sucesso. ${totalSynced} leads processados em ${durationSeconds}s.`,
       };
-
-      this.lastResult = result;
-      this.lastError = null;
-      return result;
     } catch (err) {
-      this.lastError = err instanceof Error ? err.message : String(err);
-      throw err;
-    } finally {
-      this.activeSyncStartedAt = null;
-      this.activeProgress = null;
+      const durationSeconds = Math.round((Date.now() - unitStartTime) / 1000);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const wrappedError = err instanceof Error ? err : new Error(errMsg);
+      Object.assign(wrappedError, {
+        _unitFailureContext: {
+          unidade,
+          startDate: resolvedStartDate,
+          totalSynced,
+          pagesProcessed,
+          resumedFromPending,
+          durationSeconds,
+          error: errMsg,
+        },
+      });
+      throw wrappedError;
     }
   }
 
   /**
-   * Retorna o estado atual da sincronização (em memória + watermark persistido em disco).
+   * Executa a sincronização incremental nas 17 tabelas para uma unidade específica ou para todas
+   * as unidades configuradas em sequência, com isolamento total de falhas por unidade.
+   */
+  async syncLeads(
+    customDate?: string,
+    fullSync = false,
+    unidade?: string
+  ): Promise<SyncResult> {
+    const targetUnits = this.resolveTargetUnits(unidade);
+    this.assertUnitsAvailable(targetUnits);
+
+    const startedAt = new Date().toISOString();
+    for (const unit of targetUnits) {
+      this.activeUnits.set(unit, startedAt);
+    }
+
+    const overallStartTime = Date.now();
+    const initialProgress: SyncProgress = {
+      started_at: startedAt,
+      current_unit: targetUnits[0] ?? null,
+      current_page: 0,
+      last_page: null,
+      pages_processed: 0,
+      total_synced: 0,
+      total_records: null,
+    };
+    this.activeProgress = initialProgress;
+    this.lastError = null;
+
+    const unitResults: Record<string, UnitSyncResult> = {};
+    const unitErrors: Array<{ unidade: string; error: unknown; message: string }> = [];
+
+    try {
+      for (const unit of targetUnits) {
+        try {
+          const res = await this.syncSingleUnit(unit, startedAt, customDate, fullSync);
+          unitResults[unit] = res;
+          this.unitLastResult.set(unit, res);
+          this.unitLastError.set(unit, null);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const ctx = (
+            err as {
+              _unitFailureContext?: {
+                startDate: string | null;
+                totalSynced: number;
+                pagesProcessed: number;
+                resumedFromPending: boolean;
+                durationSeconds: number;
+              };
+            }
+          )?._unitFailureContext;
+
+          const failedResult: UnitSyncResult = {
+            unidade: unit,
+            success: false,
+            startDate: ctx?.startDate ?? null,
+            totalSynced: ctx?.totalSynced ?? 0,
+            pagesProcessed: ctx?.pagesProcessed ?? 0,
+            resumedFromPending: ctx?.resumedFromPending ?? false,
+            durationSeconds: ctx?.durationSeconds ?? 0,
+            message: `Falha ao sincronizar unidade ${unit}: ${errMsg}`,
+            error: errMsg,
+          };
+
+          unitResults[unit] = failedResult;
+          this.unitLastResult.set(unit, failedResult);
+          this.unitLastError.set(unit, errMsg);
+          unitErrors.push({ unidade: unit, error: err, message: errMsg });
+
+          this.logger.error(
+            { unidade: unit, err: errMsg },
+            'Falha na sincronização da unidade; isolando erro'
+          );
+        } finally {
+          this.activeUnits.delete(unit);
+          this.unitProgress.delete(unit);
+          this.activeProgress = this.unitProgress.values().next().value ?? null;
+        }
+      }
+
+      const succeededUnits = Object.values(unitResults).filter((r) => r.success);
+
+      if (succeededUnits.length === 0) {
+        const aggregatedMsg =
+          targetUnits.length === 1
+            ? unitErrors[0]!.message
+            : `Falha ao sincronizar todas as unidades: ${unitErrors
+                .map((e) => `${e.unidade}: ${e.message}`)
+                .join('; ')}`;
+        this.lastError = aggregatedMsg;
+
+        if (targetUnits.length === 1) {
+          throw unitErrors[0]!.error;
+        }
+        throw new AppError(502, aggregatedMsg, 'SYNC_ALL_UNITS_FAILED');
+      }
+
+      const totalSynced = Object.values(unitResults).reduce((acc, r) => acc + r.totalSynced, 0);
+      const pagesProcessed = Object.values(unitResults).reduce(
+        (acc, r) => acc + r.pagesProcessed,
+        0
+      );
+      const resumedFromPending = Object.values(unitResults).some((r) => r.resumedFromPending);
+      const durationSeconds = Math.round((Date.now() - overallStartTime) / 1000);
+      const partialFailure = unitErrors.length > 0;
+      const firstSuccess = succeededUnits[0]!;
+      const failureSummary = partialFailure
+        ? unitErrors.map((e) => `${e.unidade}: ${e.message}`).join('; ')
+        : null;
+
+      const message = partialFailure
+        ? `Sincronização concluída com falha parcial (${succeededUnits.length}/${targetUnits.length} unidades). ${totalSynced} leads processados em ${durationSeconds}s. Erros: ${failureSummary}`
+        : `Sincronização concluída com sucesso. ${totalSynced} leads processados em ${durationSeconds}s.`;
+
+      const result: SyncResult = {
+        success: true,
+        ...(partialFailure ? { partial_failure: true } : {}),
+        startDate: firstSuccess.startDate ?? DEFAULT_FALLBACK_DATE,
+        totalSynced,
+        pagesProcessed,
+        resumedFromPending,
+        durationSeconds,
+        message,
+        units: unitResults,
+      };
+
+      this.lastResult = result;
+      this.lastError = failureSummary;
+      return result;
+    } finally {
+      for (const unit of targetUnits) {
+        this.activeUnits.delete(unit);
+        this.unitProgress.delete(unit);
+      }
+      if (this.activeUnits.size === 0) {
+        this.activeProgress = null;
+      }
+    }
+  }
+
+  /**
+   * Retorna o estado atual da sincronização (retrocompatível no topo + detalhamento por unidade).
    */
   async getSyncStatus(): Promise<SyncStatusSnapshot> {
-    const state = await this.readSyncState();
+    const configuredUnits = this.authManager.getUnits();
+    const allUnitNames = Array.from(
+      new Set([
+        ...configuredUnits,
+        ...this.activeUnits.keys(),
+        ...this.unitLastResult.keys(),
+        ...this.unitLastError.keys(),
+      ])
+    );
+
+    const stateEntries = await Promise.all(
+      allUnitNames.map(async (unit) => [unit, await this.safeReadSyncState(unit)] as const)
+    );
+
+    const units: Record<string, UnitSyncStatusSnapshot> = {};
+    let latestCompletedAt: string | null = null;
+    let latestCompletedMs = -Infinity;
+    let latestStartDate: string | null = null;
+
+    for (const [unit, state] of stateEntries) {
+      const unitProg = this.unitProgress.get(unit);
+      units[unit] = {
+        unidade: unit,
+        in_progress: this.activeUnits.has(unit),
+        progress: unitProg ? { ...unitProg } : null,
+        pending_start_date: state?.pending_start_date ?? null,
+        last_completed_at: state?.last_completed_at ?? null,
+        last_start_date: state?.last_start_date ?? null,
+        last_result: this.unitLastResult.get(unit) ?? null,
+        last_error: this.unitLastError.get(unit) ?? null,
+      };
+
+      if (state?.last_completed_at) {
+        const ms = Date.parse(state.last_completed_at);
+        if (!Number.isNaN(ms) && ms >= latestCompletedMs) {
+          latestCompletedMs = ms;
+          latestCompletedAt = state.last_completed_at;
+          latestStartDate = state.last_start_date;
+        } else if (latestCompletedAt === null) {
+          latestCompletedAt = state.last_completed_at;
+          latestStartDate = state.last_start_date;
+        }
+      } else if (latestStartDate === null && state?.last_start_date) {
+        latestStartDate = state.last_start_date;
+      }
+    }
+
     return {
-      in_progress: Boolean(this.activeSyncStartedAt),
+      in_progress: this.activeUnits.size > 0,
       progress: this.activeProgress ? { ...this.activeProgress } : null,
-      last_completed_at: state?.last_completed_at ?? null,
-      last_start_date: state?.last_start_date ?? null,
+      last_completed_at: latestCompletedAt,
+      last_start_date: latestStartDate,
       last_result: this.lastResult,
       last_error: this.lastError,
+      units,
     };
   }
 
   /**
    * Dispara a sincronização em segundo plano sem bloquear a resposta HTTP.
    */
-  startSyncInBackground(customDate?: string, fullSync = false): void {
-    if (this.activeSyncStartedAt) {
-      throw new AppError(
-        409,
-        `Sincronização já está em andamento desde ${this.activeSyncStartedAt}`,
-        'SYNC_IN_PROGRESS'
-      );
-    }
+  startSyncInBackground(customDate?: string, fullSync = false, unidade?: string): void {
+    const targetUnits = this.resolveTargetUnits(unidade);
+    this.assertUnitsAvailable(targetUnits);
 
-    void this.syncLeads(customDate, fullSync).catch((err) => {
+    void this.syncLeads(customDate, fullSync, unidade).catch((err) => {
       this.logger.error(
-        { err: err instanceof Error ? err.message : String(err) },
+        {
+          unidade: unidade ?? 'ALL',
+          err: err instanceof Error ? err.message : String(err),
+        },
         'Falha na sincronização assíncrona de leads'
       );
     });
   }
 
+  private async assertMetadataOwnership(
+    client: DbClientLike,
+    table: 'locations' | 'teams',
+    resourceLabel: string,
+    ids: number[],
+    unidade: string
+  ): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+
+    const res = await client.query(
+      `SELECT id, name, unidade FROM ${table} WHERE id = ANY($1::bigint[]) AND unidade <> $2 LIMIT 5;`,
+      [ids, unidade]
+    );
+    const rows = Array.isArray(res?.rows) ? res.rows : [];
+    if (rows.length === 0) {
+      return;
+    }
+
+    const conflictUnits = Array.from(
+      new Set(
+        rows
+          .map((r) => (typeof r.unidade === 'string' ? r.unidade.trim().toUpperCase() : ''))
+          .filter(Boolean)
+      )
+    );
+    const details = rows
+      .map(
+        (r) =>
+          `[${r.id}] ${r.name ?? r.id} (${String(r.unidade || '')
+            .trim()
+            .toUpperCase()})`
+      )
+      .join(', ');
+
+    this.logger.error(
+      { unidade, table, conflicts: rows },
+      `Bloqueio de segurança: tentativa de sobrescrever ${resourceLabel} de outra unidade`
+    );
+    throw new AppError(
+      409,
+      `Bloqueio de segurança: o lote da unidade ${unidade} referencia ${resourceLabel} pertencente(s) a outra unidade (${conflictUnits.join(', ')}: ${details}). Sincronização abortada sem alterar dados.`,
+      'UNIT_OWNERSHIP_CONFLICT'
+    );
+  }
+
   /**
    * Salva o lote de leads nas 17 tabelas com UPSERT em lote via UNNEST.
+   * Apenas leads, leads_raw, locations e teams possuem a coluna unidade.
    */
   private async saveBatch(
     client: DbClientLike,
+    unidade: string,
     batch: any[],
     forceUpsert = false
   ): Promise<number> {
     if (!batch.length) return 0;
 
-    const existingMap = new Map<number, number>();
-    if (!forceUpsert) {
-      const leadIds = batch
-        .map((l) => toNullableBigInt(l?.id, false))
-        .filter((id): id is number => id !== null);
+    const leadIds = Array.from(
+      new Set(
+        batch
+          .map((l) => toNullableBigInt(l?.id, false))
+          .filter((id): id is number => id !== null)
+      )
+    );
+    const batchLocationIds = Array.from(
+      new Set(
+        batch
+          .map((l) => toNullableBigInt(l?.location?.id, false))
+          .filter((id): id is number => id !== null)
+      )
+    );
+    const batchTeamIds = Array.from(
+      new Set(
+        batch
+          .flatMap((l) => [
+            toNullableBigInt(l?.team?.id, false),
+            toNullableBigInt(l?.contact?.team?.id, false),
+          ])
+          .filter((id): id is number => id !== null)
+      )
+    );
 
-      if (leadIds.length > 0) {
-        const existingRes = await client.query(
-          `SELECT id, updated_at FROM leads WHERE id = ANY($1::bigint[]);`,
-          [leadIds]
-        );
-        for (const row of existingRes.rows) {
+    const existingMap = new Map<number, number>();
+    if (leadIds.length > 0) {
+      const existingRes = await client.query(
+        `SELECT id, updated_at, unidade FROM leads WHERE id = ANY($1::bigint[]);`,
+        [leadIds]
+      );
+      const existingRows = Array.isArray(existingRes?.rows) ? existingRes.rows : [];
+      const conflictingLeads: Array<{ id: number; existingUnidade: string }> = [];
+
+      for (const row of existingRows) {
+        const existingUnidade =
+          typeof row.unidade === 'string' ? row.unidade.trim().toUpperCase() : null;
+        if (existingUnidade && existingUnidade !== unidade) {
+          conflictingLeads.push({ id: Number(row.id), existingUnidade });
+          continue;
+        }
+
+        if (!forceUpsert) {
           const ms = normalizeTimestampMs(row.updated_at);
           if (ms !== null) {
             existingMap.set(Number(row.id), ms);
           }
         }
       }
+
+      if (conflictingLeads.length > 0) {
+        const conflictUnits = Array.from(new Set(conflictingLeads.map((c) => c.existingUnidade)));
+        const sampleIds = conflictingLeads.slice(0, 5).map((c) => c.id);
+        this.logger.error(
+          { unidade, conflictingLeads: conflictingLeads.slice(0, 5) },
+          'Bloqueio de segurança: tentativa de sobrescrever leads de outra unidade'
+        );
+        throw new AppError(
+          409,
+          `Bloqueio de segurança: o lote da unidade ${unidade} contém lead(s) pertencente(s) a outra unidade (${conflictUnits.join(', ')} — ex.: lead_id ${sampleIds.join(', ')}). Sincronização abortada sem alterar dados.`,
+          'UNIT_OWNERSHIP_CONFLICT'
+        );
+      }
     }
+
+    await this.assertMetadataOwnership(client, 'locations', 'loja(s)', batchLocationIds, unidade);
+    await this.assertMetadataOwnership(client, 'teams', 'equipe(s)', batchTeamIds, unidade);
 
     const rawMap = new Map<number, { leadId: number; payloadJson: string }>();
     const attendantsMap = new Map<number, string | null>();
@@ -857,7 +1251,6 @@ export class SyncService {
           scheduleReasonsMap.set(reasonId, toNullableString(reason.name));
         }
 
-        // Garante unicidade tanto por lead_id quanto por id no mesmo UNNEST
         for (const [existingLeadId, existingSched] of schedulesMap.entries()) {
           if (existingSched.id === schedId && existingLeadId !== leadId) {
             schedulesMap.delete(existingLeadId);
@@ -963,13 +1356,18 @@ export class SyncService {
     if (rawMap.size > 0) {
       const items = [...rawMap.values()];
       await client.query(
-        `INSERT INTO leads_raw (lead_id, payload, synced_at)
-         SELECT lead_id, payload, NOW()
-         FROM UNNEST($1::bigint[], $2::jsonb[]) AS t(lead_id, payload)
+        `INSERT INTO leads_raw (lead_id, payload, unidade, synced_at)
+         SELECT lead_id, payload, unidade, NOW()
+         FROM UNNEST($1::bigint[], $2::jsonb[], $3::varchar[]) AS t(lead_id, payload, unidade)
          ON CONFLICT (lead_id) DO UPDATE SET
            payload = EXCLUDED.payload,
-           synced_at = EXCLUDED.synced_at;`,
-        [items.map((i) => i.leadId), items.map((i) => i.payloadJson)]
+           synced_at = EXCLUDED.synced_at
+         WHERE leads_raw.unidade = EXCLUDED.unidade;`,
+        [
+          items.map((i) => i.leadId),
+          items.map((i) => i.payloadJson),
+          items.map(() => unidade),
+        ]
       );
     }
 
@@ -986,20 +1384,32 @@ export class SyncService {
     if (teamsMap.size > 0) {
       const entries = [...teamsMap.entries()];
       await client.query(
-        `INSERT INTO teams (id, name)
-         SELECT * FROM UNNEST($1::bigint[], $2::text[])
-         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;`,
-        [entries.map(([id]) => id), entries.map(([, name]) => name)]
+        `INSERT INTO teams (id, name, unidade)
+         SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::varchar[])
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name
+         WHERE teams.unidade = EXCLUDED.unidade;`,
+        [
+          entries.map(([id]) => id),
+          entries.map(([, name]) => name),
+          entries.map(() => unidade),
+        ]
       );
     }
 
     if (locationsMap.size > 0) {
       const entries = [...locationsMap.entries()];
       await client.query(
-        `INSERT INTO locations (id, name)
-         SELECT * FROM UNNEST($1::bigint[], $2::text[])
-         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;`,
-        [entries.map(([id]) => id), entries.map(([, name]) => name)]
+        `INSERT INTO locations (id, name, unidade)
+         SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::varchar[])
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name
+         WHERE locations.unidade = EXCLUDED.unidade;`,
+        [
+          entries.map(([id]) => id),
+          entries.map(([, name]) => name),
+          entries.map(() => unidade),
+        ]
       );
     }
 
@@ -1110,13 +1520,13 @@ export class SyncService {
            id, name, perception, status, conversion_goal, flow, message,
            integration_third_party_id, custom_key, fbclid, gclid, dsv_id,
            vehicle_price, contact_id, attendant_id, location_id, team_id,
-           salesman_id, first_interaction_at, last_interaction_at, created_at, updated_at
+           salesman_id, first_interaction_at, last_interaction_at, created_at, updated_at, unidade
          )
          SELECT * FROM UNNEST(
            $1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
            $8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
            $13::text[], $14::bigint[], $15::bigint[], $16::bigint[], $17::bigint[],
-           $18::bigint[], $19::timestamptz[], $20::timestamptz[], $21::timestamptz[], $22::timestamptz[]
+           $18::bigint[], $19::timestamptz[], $20::timestamptz[], $21::timestamptz[], $22::timestamptz[], $23::varchar[]
          )
          ON CONFLICT (id) DO UPDATE SET
            name = EXCLUDED.name,
@@ -1139,7 +1549,8 @@ export class SyncService {
            first_interaction_at = EXCLUDED.first_interaction_at,
            last_interaction_at = EXCLUDED.last_interaction_at,
            created_at = COALESCE(EXCLUDED.created_at, leads.created_at),
-           updated_at = EXCLUDED.updated_at;`,
+           updated_at = EXCLUDED.updated_at
+         WHERE leads.unidade = EXCLUDED.unidade;`,
         [
           items.map((i) => i.id),
           items.map((i) => i.name),
@@ -1163,6 +1574,7 @@ export class SyncService {
           items.map((i) => i.last_interaction_at),
           items.map((i) => i.created_at),
           items.map((i) => i.updated_at),
+          items.map(() => unidade),
         ]
       );
     }
